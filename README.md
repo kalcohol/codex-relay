@@ -2,7 +2,7 @@
 
 > 本地重写代理：修复 Codex multi-agent v2 在第三方 Responses 兼容端点（DeepSeek / GLM / Kimi）上的子代理消息投递，零侵入、可随时撤除。
 
-**状态**：实现完成并通过三家真实端点验证（2026-09-11）。代理主体 + 测试 + 部署脚本已落地；DeepSeek / GLM / Kimi 各跑一轮真实 `spawn_agent`，五项断言全部通过（含 kill 韧性测试），见 [docs/verify.md](docs/verify.md)。设计方案全文：[docs/plan.md](docs/plan.md)。
+**状态**：实现完成并通过三家真实端点验证（2026-09-11）。代理主体 + 测试 + 部署脚本已落地；DeepSeek / GLM / Kimi 各跑一轮真实 `spawn_agent`，探针自动化的四项断言（一/二/三/五）全过，另有两项手工实测也通过：断言四（修复前旧会话 resume，Kimi）与断言六（kill 代理后监督进程秒级恢复）。详见 [docs/verify.md](docs/verify.md)。设计方案全文：[docs/plan.md](docs/plan.md)。
 
 | 文档 | 内容 |
 |---|---|
@@ -46,13 +46,13 @@ Codex CLI ◀──[SSE]──────  钩子 B：给 collaboration functio
 
 - Node.js ≥ 18（零第三方依赖，单文件 `relay.js`）
 - Codex CLI ≥ 0.147（v2 明文路径自该版本存在；**本轮验收在 0.154.0 上完成**，0.153.4 亦通过）
-- 模型目录标了 `"multi_agent_version": "v2"`：DeepSeek / Kimi 已自带；**GLM 原本缺失，用 `node deploy\patch-catalog-v2.js "$env:USERPROFILE\.codex-glm\models.json" --apply` 补上**——未标会落 v1（v1 请求带 `tool_search`，glm-5.3 不会主动用它发现工具，实测两轮失败）
+- 模型目录已标 `multi_agent_version = "v2"`（未标会落 v1：v1 请求带 `tool_search`，glm-5.3 不会主动用它发现工具，实测两轮失败）。三家现状与补标记命令见 [docs/deploy.md](docs/deploy.md) §0 —— **GLM 原本缺这一行，已用 `deploy\patch-catalog-v2.js` 补上**
 
 ## 当前状态（本机）
 
 - 三个端点代理已按计划任务常驻（`codex-relay-deepseek` / `-glm` / `-kimi`，登录自启 + 失败重启 + 进程退出秒级拉起）；
 - 三份 `CODEX_HOME` 的 `base_url` 已指向本机代理，`config.toml` 备份为 `config.toml.bak-<时间戳>`，另有一份集中备份在 `~/codex-relay-backup-20260911/`；
-- 三家已在真实配置下各跑过一轮 `spawn_agent` 验收，五项断言全过，详见 [docs/verify.md](docs/verify.md)。
+- 三家已在真实配置下各跑过一轮 `spawn_agent` 验收，探针四项断言（一/二/三/五）全过；断言四（修复前旧会话 resume）与断言六（kill 韧性）为手工实测，亦通过。详见 [docs/verify.md](docs/verify.md)。
 
 ## 快速开始
 
@@ -108,7 +108,7 @@ API key 照旧放在原环境变量（`DEEPSEEK_API_KEY` / `GLM_API_KEY` / `KIMI
 ## 验证
 
 ```powershell
-# 自动化：临时 CODEX_HOME 跑真实 spawn_agent，核对五项断言（不碰真实配置）
+# 自动化：临时 CODEX_HOME 跑真实 spawn_agent，核对探针四项断言（不碰真实配置）
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -Vendor kimi
 ```
 

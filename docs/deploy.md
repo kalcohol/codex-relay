@@ -9,7 +9,7 @@
 | 代理进程 | 三个端点各一个，由计划任务 `codex-relay-<端点>` 监督（登录自启、失败每分钟重启、进程退出秒级拉起） |
 | `base_url` | 三份 `CODEX_HOME` 已指向本机代理；原值见下表，配置文件原样备份为 `config.toml.bak-<时间戳>`，另有一份集中备份 `~/codex-relay-backup-20260911/` |
 | 模型目录 | 三家均已标 `multi_agent_version = "v2"`（GLM 由 `patch-catalog-v2.js` 补，备份 `models.json.bak-*`） |
-| 验收 | 真实配置下三家各跑一轮 `spawn_agent`，五项断言全过；存量会话（Kimi）resume 复验通过（[verify.md](verify.md) §3） |
+| 验收 | 真实配置下三家各跑一轮 `spawn_agent`，探针四项断言（一/二/三/五）全过；断言四（存量会话 resume）与断言六（kill 韧性）手工实测通过（[verify.md](verify.md) §3） |
 | Codex 版本 | 0.154.0 |
 
 回退见 §7（一条命令恢复直连）。以下为各部分的操作细节。
@@ -111,24 +111,30 @@ curl.exe http://127.0.0.1:18781/healthz
 powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -Vendor kimi
 ```
 
-`probe-subagent.ps1` 会把 `~/.codex-<vendor>` 复制到 `%LOCALAPPDATA%\codex-relay\verify\<vendor>\home`，只改副本的 `base_url` 与模型目录（GLM 顺带补 v2 标记），跑完输出五项断言结论；报告与 rollout 都留在该目录便于复查。详见 [verify.md](verify.md)。
+`probe-subagent.ps1` 会把 `~/.codex-<vendor>` 复制到 `%LOCALAPPDATA%\codex-relay\verify\<vendor>\home`，只改副本的 `base_url` 与模型目录（GLM 顺带补 v2 标记），跑完输出探针四项断言（一/二/三/五）的结论；报告与 rollout 都留在该目录便于复查。详见 [verify.md](verify.md)。
 
 ## 6. 观测与排障
 
 | 手段 | 用法 |
 |---|---|
-| 健康 + 计数 | `GET /healthz`：`a_rewrites` / `b_injections` / `errors` / `client_aborts` / `completed_aborts` |
+| 健康 + 计数 | `GET /healthz`：`requests` / `a_rewrites` / `b_injections` / `b_skipped` / `errors` / `client_aborts` / `completed_aborts` |
 | 逐请求日志 | 起代理时设 `CODEX_RELAY_LOG=1`，输出 `#序号 状态 耗时 A=改写数` 与命中行 |
 | 抓包 | 起代理时设 `CODEX_RELAY_CAPTURE=<目录>`，落 `req-*.json` / `res-*.sse`，`Authorization` 脱敏；含全量 prompt，用完即删 |
 
 **计数含义**（`errors` 之外的计数都表示正常行为，不作为故障判据）：
 
+- `requests`：**只统计数据面**（`/healthz` 探活与监督脚本的探测不计入），等于"实际打给端点的模型请求数"；
 - `client_aborts`：Codex 收齐/主动取消后断开连接；
 - `completed_aborts`：已收到 `response.completed` 后厂商关闭连接（Kimi 实测如此，属正常）；
 - `errors`：客户端仍在等而上游失败——**只有这个需要排查**。
 
+一次连接的中断只记一次：客户端断开与随之而来的上游断开是因果关系，代理内部归口到单一计数点（`abortCounted`），不会重复计数。
+
 日志位置：`%LOCALAPPDATA%\codex-relay\logs\`
 （`<端点>-supervisor.log` 监督记录、`<端点>-<时间戳>.out.log` 代理输出、`<端点>-ensure.*.log` ensure 输出）。
+每个端点的 `<时间戳>.out/.err.log` 只保留最近 20 对（崩溃循环时自动清理最旧的）；`-supervisor.log` 持续追加、不轮转。
+
+**重载代理（改完代码/想重启进程）** 用 `ensure-proxy.ps1 -Restart`：它停掉监听进程，由现任监督进程拉起新进程（等待窗口覆盖一个退避周期）。**不要**手工去 kill 监督进程，也不要另起一个监督进程——同一端点同时只应有一个监督进程，重复拉起会被锁挡住并在日志里留下记录。
 
 **升级 Codex 后必做**：跑一次 `probe-subagent.ps1`，确认 `A` 与 `B` 计数仍 > 0。DS / GLM 端点的形态失配是静默的——退回原始 bug，不会有任何报错。
 

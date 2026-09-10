@@ -37,7 +37,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -V
 
 > 断言四的入口注意：Codex 拒绝单独 resume 子代理线程（报 `cannot resume an unloaded multi-agent v2 sub-agent through its parent`），必须 resume **父会话**，由父会话按需加载子线程。
 
-手工核对（需要人看的部分）：断言一、二、四。取证据的方法：
+手工核对（需要人看的部分）：断言一、二、四（断言六是手工 kill 测试，也已实测）。取证据的方法：
 
 ```powershell
 # 断言二的证据：子线程收到的任务消息
@@ -57,7 +57,7 @@ Select-String -Path "$env:LOCALAPPDATA\codex-relay\verify\<vendor>\home\sessions
 | GLM | ✅ | ✅ | ✅ `errors=0` | ✅ 3 / 2 | 临时目录补了 `multi_agent_version=v2`（真实目录当时缺） |
 | Kimi | ✅ | ✅ | ✅ `errors=0`（2 次 `completed_aborts`） | ✅ 2 / 2 | 关键项：`agent_message` 类型级拒绝由钩子 A 化解 |
 
-第二轮（真实配置切换后，`-RealHome`）：三家同样五项断言全过（A / B 增量各 2；Kimi 另有 2 次正常的 `completed_aborts`）。产物见 `%LOCALAPPDATA%\codex-relay\verify\<vendor>\report-realhome.txt`。
+第二轮（真实配置切换后，`-RealHome`）：三家探针四项断言同样全过（A / B 增量各 2；Kimi 另有 2 次正常的 `completed_aborts`）。产物见 `%LOCALAPPDATA%\codex-relay\verify\<vendor>\report-realhome.txt`。
 
 **断言四（R3，存量会话）**：取修复前 400 的 Kimi 会话（`_investigation/exp-kimi-v2/home/sessions/2026/09/10/rollout-2026-09-10T22-13-48-01a08baa-e75f-….jsonl`，其 `task_complete` 事件留有 `input.10: item type "agent_message" is not supported` 的现场），复制进临时 CODEX_HOME（base_url 指向抓包代理）后 `codex exec resume <父会话 id>`：
 
@@ -78,7 +78,9 @@ Select-String -Path "$env:LOCALAPPDATA\codex-relay\verify\<vendor>\home\sessions
 
 同时验证了被强杀后残留锁文件的场景（监督进程与 relay 同时被 `Stop-Process -Force`，finally 不执行 → 锁残留）：新一轮 `ensure` 在 3.8 秒内完成接管并恢复健康（含 PowerShell 启动与健康轮询），与"空锁"（旧版本残留）场景一致。判断依据不依赖锁文件里的 PID，而是"能否重新独占打开锁文件"——进程被强杀时文件句柄由系统释放，能独占打开即持有者已死。
 
-**未覆盖**：断言四（存量会话 resume）需用修复前落盘的旧会话手工执行——Kimi 的旧会话在 `~/.codex-kimi/sessions` 下，可用 `codex resume --last` 复现；本次未跑（涉及真实历史会话）。
+`-Restart`（改完代码后重载代理）的语义：停掉监听进程，由**现任**监督进程按自己的节奏拉起新进程（不再另起监督进程，否则会与现任争锁）；等待窗口覆盖一个退避周期（≥35s），实测三家各 1–2 秒完成、耗时 5.5 秒、无假失败。注意连续重启会命中监督进程的退避（uptime < 30s 时 2s → 30s 封顶），此时 `-Restart` 会等待；期间 `-Status` 会如实报告 DOWN。
+
+监督进程的锁还有一条关键规则：**只有真正持有过锁的进程才在退出时清理锁文件**。曾经的实现让"没拿到锁的第二实例"也在 finally 里删锁，等于偷走现任者的锁——于是 `ensure` 与计划任务会不断拉起新监督进程、多个进程抢同一端口。现由单测外的场景实测确认（`-Restart` 不再产生重复监督进程）。
 
 ## 4. 已知不覆盖
 
