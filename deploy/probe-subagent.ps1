@@ -12,6 +12,9 @@
   会发起真实 API 调用（消耗额度）。
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -Vendor deepseek
+.EXAMPLE
+  # 已按 docs/deploy.md 切换完真实配置后，直接验真实环境（会写真实会话历史）
+  powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -Vendor kimi -RealHome
 #>
 [CmdletBinding()]
 param(
@@ -20,7 +23,8 @@ param(
   [string]$Token,
   [string]$WorkRoot = (Join-Path $env:LOCALAPPDATA 'codex-relay\verify'),
   [int]$TimeoutSec = 420,
-  [switch]$KeepHome
+  [switch]$KeepHome,
+  [switch]$RealHome
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,22 +36,44 @@ $cfg = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConfigPath), [S
 $ep = $cfg.endpoints | Where-Object { $_.name -eq $Vendor } | Select-Object -First 1
 if (-not $ep) { throw "relay.config.json 中找不到端点 $Vendor" }
 
-$realHome = $ep.codexHome -replace '^~', $env:USERPROFILE
-$probeHome = Join-Path $WorkRoot "$Vendor\home"
+$realHomeDir = $ep.codexHome -replace '^~', $env:USERPROFILE
+# 变量名不能取 $realHome：PowerShell 变量名大小写不敏感，会与 [switch]$RealHome 撞成同一个
+# 变量，于是"给开关赋字符串"直接抛 无法转换为 SwitchParameter。
+$probeHome = if ($RealHome) { $realHomeDir } else { Join-Path $WorkRoot "$Vendor\home" }
 $scratch = Join-Path $WorkRoot "$Vendor\scratch"
-$report = Join-Path $WorkRoot "$Vendor\report.txt"
+$report = Join-Path $WorkRoot "$Vendor\report$($(if ($RealHome) { '-realhome' } else { '' })).txt"
 
 function Write-Step([string]$m) {
   Write-Host $m
   Add-Content -LiteralPath $report -Value $m
 }
 
-Remove-Item -Recurse -Force $probeHome, $scratch -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $probeHome, $scratch | Out-Null
-Set-Content -LiteralPath $report -Value "vendor=$Vendor token=$Token time=$(Get-Date -Format o)" -Encoding utf8
+# 真实配置模式下绝不能删除 CODEX_HOME 本身
+if ($RealHome) {
+  New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+} else {
+  Remove-Item -Recurse -Force $probeHome, $scratch -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $probeHome, $scratch | Out-Null
+}
+Set-Content -LiteralPath $report -Value "vendor=$Vendor token=$Token realHome=$RealHome time=$(Get-Date -Format o)" -Encoding utf8
 
+if ($RealHome) {
+  # --- 真实 CODEX_HOME：只读检查（base_url 是否已指向代理、模型目录是否标 v2）---
+  $config = [System.IO.File]::ReadAllText((Join-Path $realHomeDir 'config.toml'), [System.Text.Encoding]::UTF8)
+  $model = ([regex]::Match($config, 'model\s*=\s*"([^"]+)"')).Groups[1].Value
+  if (-not $config.Contains($ep.baseUrlAfter)) {
+    throw "config.toml 的 base_url 未指向代理（期望 $($ep.baseUrlAfter)），请先运行 switch-base-url.ps1 -Apply"
+  }
+  $catalogFile = Join-Path $realHomeDir 'models.json'
+  $catalogText = [System.IO.File]::ReadAllText($catalogFile, [System.Text.Encoding]::UTF8)
+  $catalogJson = $catalogText | ConvertFrom-Json
+  $entry = $catalogJson.models | Where-Object { $_.slug -eq $model } | Select-Object -First 1
+  Write-Step "model=$model base_url=$($ep.baseUrlAfter)（真实配置）"
+  Write-Step "catalog: $model multi_agent_version=$($entry.multi_agent_version)"
+  if ($entry.multi_agent_version -ne 'v2') { throw "模型 $model 未标 v2（用 deploy\patch-catalog-v2.js 补）" }
+} else {
 # --- 1) 临时 CODEX_HOME：改 base_url、模型目录路径，并补 v2 标记 -----------------
-$config = [System.IO.File]::ReadAllText((Join-Path $realHome 'config.toml'), [System.Text.Encoding]::UTF8)
+$config = [System.IO.File]::ReadAllText((Join-Path $realHomeDir 'config.toml'), [System.Text.Encoding]::UTF8)
 if (-not $config.Contains($ep.baseUrlOriginal)) {
   throw "config.toml 里找不到 $($ep.baseUrlOriginal)（手动改过？）"
 }
@@ -56,15 +82,15 @@ $config = $config.Replace($ep.baseUrlOriginal, $ep.baseUrlAfter)
 $model = ([regex]::Match($config, 'model\s*=\s*"([^"]+)"')).Groups[1].Value
 Write-Step "model=$model base_url→$($ep.baseUrlAfter)"
 
-Copy-Item -LiteralPath (Join-Path $realHome 'models.json') -Destination (Join-Path $probeHome 'models.json')
+Copy-Item -LiteralPath (Join-Path $realHomeDir 'models.json') -Destination (Join-Path $probeHome 'models.json')
 $catalogPath = Join-Path $probeHome 'models.json'
 $catalog = [System.IO.File]::ReadAllText($catalogPath, [System.Text.Encoding]::UTF8)
-$catalog = $catalog.Replace((Join-Path $realHome 'models.json').Replace('\', '/'), $catalogPath.Replace('\', '/'))
+$catalog = $catalog.Replace((Join-Path $realHomeDir 'models.json').Replace('\', '/'), $catalogPath.Replace('\', '/'))
 # config.toml 里 model_catalog_json 可能写成正斜杠或反斜杠，两种都替换一遍。
-$catalog = $catalog.Replace($realHome, $probeHome)
-$config = $config.Replace($realHome, $probeHome)
-$config = $config.Replace((Join-Path $realHome 'models.json'), $catalogPath)
-$config = $config.Replace((Join-Path $realHome 'models.json').Replace('\', '/'), $catalogPath.Replace('\', '/'))
+$catalog = $catalog.Replace($realHomeDir, $probeHome)
+$config = $config.Replace($realHomeDir, $probeHome)
+$config = $config.Replace((Join-Path $realHomeDir 'models.json'), $catalogPath)
+$config = $config.Replace((Join-Path $realHomeDir 'models.json').Replace('\', '/'), $catalogPath.Replace('\', '/'))
 
 $slugPattern = '"slug"\s*:\s*"' + [regex]::Escape($model) + '"'
 if (-not $catalog.Contains('"multi_agent_version"')) {
@@ -83,6 +109,7 @@ if ($config -notmatch [regex]::Escape($scratch.Replace('\', '\\'))) {
   $config += "`n[projects.'$($scratch.Replace('\', '\\'))']`ntrust_level = `"trusted`"`n"
 }
 [System.IO.File]::WriteAllText((Join-Path $probeHome 'config.toml'), $config, (New-Object System.Text.UTF8Encoding($false)))
+}
 
 # --- 2) 确保代理在跑 -----------------------------------------------------------
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'ensure-proxy.ps1') -Only $Vendor -Strict
@@ -171,8 +198,10 @@ $pass += if ($dA -gt 0) { "PASS 断言五a：钩子 A 改写 $dA 次" } else { '
 $pass += if ($dB -gt 0) { "PASS 断言五b：钩子 B 注入 $dB 次" } else { 'FAIL 断言五b：钩子 B 未命中' }
 $pass | ForEach-Object { Write-Step $_ }
 
-if (-not $KeepHome) {
+if (-not $RealHome) {
   Write-Step "临时目录保留在 $($probeHome -replace '\\home$', '')（如需清理请手动删除）"
+} else {
+  Write-Step "本次为真实环境验证：会话已写入 $probeHome\sessions"
 }
 Write-Host ''
 Write-Host "报告: $report"
