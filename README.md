@@ -147,4 +147,5 @@ npm test        # 43 个用例：改写正确性、SSE 分帧（任意字节边�
 - 设计方案（根因链、源码引证、验收标准、风险表、上游 issue 草稿）：[docs/plan.md](docs/plan.md)
 - 部署运维（安装、切换、常驻、排障、回退）：[docs/deploy.md](docs/deploy.md)
 - 验收回归（探针用法、断言判据、实测记录）：[docs/verify.md](docs/verify.md)
+- 手工速测（自己开交互式 Codex 跑一轮的 prompt 与判读）：[docs/manual-test.md](docs/manual-test.md)
 - 证据目录（抓包 / 实验 rollout）：留在本地 `_investigation/` 未随仓库发布（含真实会话内容，方案 §10 有索引）
