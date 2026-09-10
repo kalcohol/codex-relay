@@ -28,7 +28,7 @@
 
 ```powershell
 node --version              # >= 18
-codex --version             # >= 0.147（实测 0.153.4）
+codex --version             # >= 0.147（实测 0.154.0）
 curl.exe http://127.0.0.1:18781/healthz   # 未部署时应连接失败
 ```
 
@@ -36,7 +36,7 @@ curl.exe http://127.0.0.1:18781/healthz   # 未部署时应连接失败
 
 | 端点 | 现状（2026-09-11 实测） |
 |---|---|
-| DeepSeek | `~/.codex-deepseek/models.json` 各条目已带 `"multi_agent_version": "v2"` |
+| DeepSeek | 官方目录自带：`deepseek-flash` / `deepseek-v4-pro` 均带 `"multi_agent_version": "v2"` |
 | Kimi | `~/.codex-kimi/models.json` 的 `k3` / `k3-256k` 已带 |
 | GLM | **原本缺失，已用脚本补上**：`glm-5.3` / `glm-5-turbo` 均补了 `"multi_agent_version": "v2"`（写入前已备份） |
 
@@ -50,6 +50,25 @@ node deploy\patch-catalog-v2.js "$env:USERPROFILE\.codex-glm\models.json" --appl
 不带 slug 时处理目录中所有缺该字段的模型；重复执行是幂等的。
 
 GLM 不补这一行会落 v1：v1 请求带 `tool_search` 工具面，而 glm-5.3 不会主动用它发现工具（plan §3.1 实测两轮失败）。
+
+### 厂商更新模型时（以 DeepSeek 2026-09-11 为例）
+
+厂商会下架旧 slug、新增新 slug。**在这个仓库的部署方式下，不要运行厂商的一键配置脚本**——DeepSeek 官方脚本的两条写入路径都会重建 `[model_providers.deepseek]` 段并把 `base_url` 写死为官方直连地址、把 key 写进配置文件，等于**静默旁路掉本地代理**（修复失效、退回原始 bug，且没有报错）。它的"只改 model"快路径要求脚本自己的备份存在，而我们这份 `CODEX_HOME` 从没跑过它。
+
+正确做法（只动两处，代理配置保持不变）：
+
+1. 从官方脚本内嵌的 here-string 里取出新目录，替换 `models.json`；
+2. 改 `config.toml` 里顶层 `model =` 为新 slug（DeepSeek 新默认是 `deepseek-flash`；`deepseek-v4-pro` 于 9 月 14 日下线）；
+3. 验证：`powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -Vendor deepseek -RealHome`，探针四项断言应全过。
+
+这次实际改动（2026-09-11）与保留项：
+
+| 项 | 处理 |
+|---|---|
+| `model` | `deepseek-v4.1-flash-expires-on-0910`（已下架）→ `deepseek-flash` |
+| `models.json` | 换成官方新目录（2 个条目，均自带 v2）；旧目录备份为 `models.json.bak-<时间戳>` |
+| 按官方新增 | `preferred_auth_method = "apikey"`、`forced_login_method = "api"`（跳过 ChatGPT 登录）、`web_search = "disabled"`（官方明确：DeepSeek 模型下禁用内置联网搜索） |
+| **保留不动** | `base_url = http://127.0.0.1:18781/`（代理）、`env_key`（密钥仍走环境变量，不落盘）、`model_reasoning_effort = "max"`（新目录支持 low/high/max）、`model_catalog_json`、`approvals_reviewer`、`service_tier`、`[projects]` 信任项、`[windows]`、`[tui]` |
 
 ## 1. 拉起代理
 
