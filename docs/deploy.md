@@ -2,6 +2,18 @@
 
 面向本机使用者。设计方案见 [plan.md](plan.md) §5；验收流程见 [verify.md](verify.md)。
 
+## 本机当前状态（2026-09-11 部署完成）
+
+| 项 | 状态 |
+|---|---|
+| 代理进程 | 三个端点各一个，由计划任务 `codex-relay-<端点>` 监督（登录自启、失败每分钟重启、进程退出秒级拉起） |
+| `base_url` | 三份 `CODEX_HOME` 已指向本机代理；原值见下表，配置文件原样备份为 `config.toml.bak-<时间戳>`，另有一份集中备份 `~/codex-relay-backup-20260911/` |
+| 模型目录 | 三家均已标 `multi_agent_version = "v2"`（GLM 由 `patch-catalog-v2.js` 补，备份 `models.json.bak-*`） |
+| 验收 | 真实配置下三家各跑一轮 `spawn_agent`，五项断言全过；存量会话（Kimi）resume 复验通过（[verify.md](verify.md) §3） |
+| Codex 版本 | 0.154.0 |
+
+回退见 §7（一条命令恢复直连）。以下为各部分的操作细节。
+
 三层的分工（缺一不可）：
 
 | 层 | 作用 | 覆盖时机 |
@@ -26,9 +38,18 @@ curl.exe http://127.0.0.1:18781/healthz   # 未部署时应连接失败
 |---|---|
 | DeepSeek | `~/.codex-deepseek/models.json` 各条目已带 `"multi_agent_version": "v2"` |
 | Kimi | `~/.codex-kimi/models.json` 的 `k3` / `k3-256k` 已带 |
-| **GLM** | **缺失**：`~/.codex-glm/models.json` 中 `glm-5.3` 需手工补一行 `"multi_agent_version": "v2",`（与 `"slug": "glm-5.3",` 同级） |
+| GLM | **原本缺失，已用脚本补上**：`glm-5.3` / `glm-5-turbo` 均补了 `"multi_agent_version": "v2"`（写入前已备份） |
 
-GLM 不补这一行时会落 v1：v1 请求带 `tool_search` 工具面，而 glm-5.3 不会主动用它发现工具（plan §3.1 实测两轮失败）。
+补标记用脚本（先预览，`--apply` 才写入，自动备份并校验仍是合法 JSON）：
+
+```powershell
+node deploy\patch-catalog-v2.js "$env:USERPROFILE\.codex-glm\models.json"            # 预览
+node deploy\patch-catalog-v2.js "$env:USERPROFILE\.codex-glm\models.json" --apply    # 写入
+```
+
+不带 slug 时处理目录中所有缺该字段的模型；重复执行是幂等的。
+
+GLM 不补这一行会落 v1：v1 请求带 `tool_search` 工具面，而 glm-5.3 不会主动用它发现工具（plan §3.1 实测两轮失败）。
 
 ## 1. 拉起代理
 

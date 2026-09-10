@@ -45,8 +45,14 @@ Codex CLI ◀──[SSE]──────  钩子 B：给 collaboration functio
 ## 环境要求
 
 - Node.js ≥ 18（零第三方依赖，单文件 `relay.js`）
-- Codex CLI ≥ 0.147（v2 明文路径自该版本存在；实测基线 0.153.4，0.154.0 复核问题仍在）
-- 模型目录标了 `"multi_agent_version": "v2"`：Kimi（`~/.codex-kimi/models.json`）已标；**GLM 需手工补一行**——`~/.codex-glm/models.json` 中 `glm-5.3` 同级加 `"multi_agent_version": "v2",`，未标会落 v1（v1 请求带 `tool_search`，glm-5.3 不会主动用它发现工具，实测两轮失败）
+- Codex CLI ≥ 0.147（v2 明文路径自该版本存在；**本轮验收在 0.154.0 上完成**，0.153.4 亦通过）
+- 模型目录标了 `"multi_agent_version": "v2"`：DeepSeek / Kimi 已自带；**GLM 原本缺失，用 `node deploy\patch-catalog-v2.js "$env:USERPROFILE\.codex-glm\models.json" --apply` 补上**——未标会落 v1（v1 请求带 `tool_search`，glm-5.3 不会主动用它发现工具，实测两轮失败）
+
+## 当前状态（本机）
+
+- 三个端点代理已按计划任务常驻（`codex-relay-deepseek` / `-glm` / `-kimi`，登录自启 + 失败重启 + 进程退出秒级拉起）；
+- 三份 `CODEX_HOME` 的 `base_url` 已指向本机代理，`config.toml` 备份为 `config.toml.bak-<时间戳>`，另有一份集中备份在 `~/codex-relay-backup-20260911/`；
+- 三家已在真实配置下各跑过一轮 `spawn_agent` 验收，五项断言全过，详见 [docs/verify.md](docs/verify.md)。
 
 ## 快速开始
 
