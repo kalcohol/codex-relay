@@ -74,10 +74,14 @@ if ($RealHome) {
 } else {
 # --- 1) 临时 CODEX_HOME：改 base_url、模型目录路径，并补 v2 标记 -----------------
 $config = [System.IO.File]::ReadAllText((Join-Path $realHomeDir 'config.toml'), [System.Text.Encoding]::UTF8)
-if (-not $config.Contains($ep.baseUrlOriginal)) {
-  throw "config.toml 里找不到 $($ep.baseUrlOriginal)（手动改过？）"
+if ($config.Contains($ep.baseUrlOriginal)) {
+  $config = $config.Replace($ep.baseUrlOriginal, $ep.baseUrlAfter)
+  Write-Step "temp home: base_url 由直连改为 $($ep.baseUrlAfter)"
+} elseif ($config.Contains($ep.baseUrlAfter)) {
+  Write-Step "temp home: 真实配置已指向 $($ep.baseUrlAfter)，副本沿用"
+} else {
+  throw "config.toml 里既没有 $($ep.baseUrlOriginal) 也没有 $($ep.baseUrlAfter)（手动改过？）"
 }
-$config = $config.Replace($ep.baseUrlOriginal, $ep.baseUrlAfter)
 
 $model = ([regex]::Match($config, 'model\s*=\s*"([^"]+)"')).Groups[1].Value
 Write-Step "model=$model base_url→$($ep.baseUrlAfter)"
@@ -92,8 +96,18 @@ $config = $config.Replace($realHomeDir, $probeHome)
 $config = $config.Replace((Join-Path $realHomeDir 'models.json'), $catalogPath)
 $config = $config.Replace((Join-Path $realHomeDir 'models.json').Replace('\', '/'), $catalogPath.Replace('\', '/'))
 
+# 按 slug 判定当前要用的模型是否有 v2 标记（与 -RealHome 分支一致）。
+# 不能用"整个目录里有没有 multi_agent_version"来判断：混合目录下当前模型缺标记也会被跳过，静默落 v1。
 $slugPattern = '"slug"\s*:\s*"' + [regex]::Escape($model) + '"'
-if (-not $catalog.Contains('"multi_agent_version"')) {
+$entryHasV2 = $null
+try {
+  $catalogJson = $catalog | ConvertFrom-Json
+  $entry = $catalogJson.models | Where-Object { $_.slug -eq $model } | Select-Object -First 1
+  if ($entry) { $entryHasV2 = ($entry.multi_agent_version -eq 'v2') }
+} catch { }
+if ($null -eq $entryHasV2) { $entryHasV2 = $false }   # 模型不在目录里或解析失败：按需要处理
+
+if (-not $entryHasV2) {
   $slugMatch = [regex]::Match($catalog, $slugPattern)
   if (-not $slugMatch.Success) { throw "模型目录里找不到 slug=$model" }
   $insertAt = $slugMatch.Index + $slugMatch.Length
@@ -101,7 +115,7 @@ if (-not $catalog.Contains('"multi_agent_version"')) {
   $catalog = $catalog.Insert($insertAt, "`n    `"multi_agent_version`": `"v2`",")
   Write-Step "catalog: 为 $model 补上 multi_agent_version=v2"
 } else {
-  Write-Step "catalog: 已含 multi_agent_version 标记，无需改写"
+  Write-Step "catalog: $model 已带 multi_agent_version=v2"
 }
 [System.IO.File]::WriteAllText($catalogPath, $catalog, (New-Object System.Text.UTF8Encoding($false)))
 

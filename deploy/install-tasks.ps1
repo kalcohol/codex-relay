@@ -58,7 +58,8 @@ foreach ($ep in $endpoints) {
   $node = Get-Command node -ErrorAction SilentlyContinue
   if (-not $node) { throw 'PATH 中找不到 node（需要 Node.js >= 18）' }
 
-  # 用 pwsh/powershell 承载监督脚本，保证窗口隐藏且与用户会话解耦。
+  # 固定用 Windows PowerShell 5.1 承载监督脚本：任务在用户会话内运行，
+  # 窗口隐藏（-WindowStyle Hidden 见下）且无需 pwsh 7 依赖。
   $shell = (Get-Command powershell).Source
   $action = New-ScheduledTaskAction -Execute $shell `
     -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Name {1}' -f $supervisor, $ep.name) `

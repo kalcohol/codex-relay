@@ -58,6 +58,20 @@ function Test-RelayHealthy {
   }
 }
 
+# 只保留最近 $KeepLogs 对 <Name>-<stamp>.out/.err.log（不碰 <Name>-supervisor.log 与锁文件）
+function Remove-OldLogs {
+  param([int]$KeepLogs = 20)
+  foreach ($kind in 'out', 'err') {
+    $files = Get-ChildItem -Path (Join-Path $logDir "$Name-*.$kind.log") -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending
+    if ($files.Count -gt $KeepLogs) {
+      $files | Select-Object -Skip $KeepLogs | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+      }
+    }
+  }
+}
+
 # 单实例保护。锁文件内容写自己的 PID（便于日志定位），但"是否陈旧"不依赖它：
 # 进程被强杀时文件句柄由系统释放，因此**能重新独占打开 = 原持有者已死**（含旧版本留下的空锁）；
 # 反之打不开就说明确有活着的持有者。这样避免了"陈旧锁要等固定秒数"的启动延迟。
@@ -116,6 +130,10 @@ try {
     $errLog = Join-Path $logDir "$Name-$stamp.err.log"
     $argList = @($relayJs, "$($endpoint.port)", "$($endpoint.upstream)", '--name', $endpoint.name)
 
+    # 崩溃循环时（退避 30s 封顶）每次重启都会新建一对日志文件，
+    # 一天能堆出上千个；只保留最近 KeepLogs 对。
+    Remove-OldLogs
+
     Write-Log "启动: node $($argList -join ' ')"
     $started = Get-Date
     $proc = Start-Process -FilePath $node.Source -ArgumentList $argList -WindowStyle Hidden `
@@ -132,6 +150,10 @@ try {
     Start-Sleep -Seconds $backoff
   }
 } finally {
-  if ($lock) { $lock.Dispose() }
-  Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+  # 只有真正持有过锁才清理：没拿到锁的进程（例如被 ensure 重复拉起的第二实例）
+  # 删掉锁文件等于把现任监督进程的锁偷走，会连锁引出多个监督进程抢同一端口。
+  if ($lock) {
+    $lock.Dispose()
+    Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+  }
 }

@@ -38,6 +38,39 @@ function Test-RelayHealthy {
   }
 }
 
+# 轮询等待就绪（监督进程接管通常 1–3 秒）
+function Wait-RelayHealthy {
+  param([int]$Port, [int]$TimeoutMs)
+  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-RelayHealthy -Port $Port -TimeoutMs 1000) { return $true }
+    Start-Sleep -Milliseconds 250
+  }
+  return $false
+}
+
+# 判断该端点是否已有活着的监督进程：锁文件被独占说明持有者还活着，
+# 能独占打开则说明持有者已死（与 supervise-endpoint.ps1 同一判据）。
+function Test-SupervisorAlive {
+  param([string]$Name)
+  $lockPath = Join-Path $logDir "$Name.lock"
+  if (-not (Test-Path -LiteralPath $lockPath)) { return $false }
+  try {
+    $handle = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $handle.Dispose()
+    return $false
+  } catch {
+    return $true
+  }
+}
+
+# 停掉正在监听该端口的 relay 进程（监督进程会按自己的节奏把它拉回来）
+function Stop-RelayListener {
+  param([int]$Port)
+  $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+  foreach ($c in $conn) { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue }
+}
+
 # PS 5.1 默认按 ANSI 读文件，中文注释会变乱码并破坏 JSON 解析，必须显式 UTF-8。
 $cfg = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConfigPath), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 $endpoints = $cfg.endpoints
@@ -56,15 +89,29 @@ foreach ($ep in $endpoints) {
     continue
   }
   if ($Restart -and $healthy) {
-    Write-Host ("{0,-9} :{1} 健康但仍要求重启：先停旧进程" -f $ep.name, $ep.port)
-    $conn = Get-NetTCPConnection -LocalPort $ep.port -State Listen -ErrorAction SilentlyContinue
-    foreach ($c in $conn) { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 500
+    Write-Host ("{0,-9} :{1} 重启：停掉当前 relay 进程，等监督进程拉起新进程" -f $ep.name, $ep.port)
+    Stop-RelayListener -Port $ep.port
   }
   if ($Status) {
     Write-Host ("{0,-9} :{1} DOWN" -f $ep.name, $ep.port)
     $failures += 1
     continue
+  }
+
+  # 已在跑的监督进程会自己把 relay 拉回来，等它就够——这里再起一个监督进程
+  # 只会和现任争锁，最后报出"未就绪"的假失败。
+  if ($Restart -or (Test-SupervisorAlive -Name $ep.name)) {
+    # 手动重启会被监督进程当作"快速失败"，退避可能涨到 30s；这里等够一个退避周期。
+    $waitMs = if ($Restart) { [Math]::Max($TimeoutMs, 35000) } else { [Math]::Min($TimeoutMs, 6000) }
+    if (Wait-RelayHealthy -Port $ep.port -TimeoutMs $waitMs) {
+      Write-Host ("{0,-9} :{1} up（监督进程已拉起）" -f $ep.name, $ep.port)
+      continue
+    }
+    if (Test-SupervisorAlive -Name $ep.name) {
+      Write-Host ("{0,-9} :{1} 未就绪，但监督进程在运行（可能正在退避重启，见 $logDir）" -f $ep.name, $ep.port)
+      $failures += 1
+      continue
+    }
   }
 
   Write-Host ("{0,-9} :{1} down → 拉起监督进程" -f $ep.name, $ep.port)
@@ -74,13 +121,7 @@ foreach ($ep in $endpoints) {
     -RedirectStandardOutput (Join-Path $logDir "$($ep.name)-ensure.out.log") `
     -RedirectStandardError (Join-Path $logDir "$($ep.name)-ensure.err.log") | Out-Null
 
-  $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-  $up = $false
-  while ((Get-Date) -lt $deadline) {
-    if (Test-RelayHealthy -Port $ep.port -TimeoutMs 1000) { $up = $true; break }
-    Start-Sleep -Milliseconds 250
-  }
-  if ($up) {
+  if (Wait-RelayHealthy -Port $ep.port -TimeoutMs $TimeoutMs) {
     Write-Host ("{0,-9} :{1} up（已启动）" -f $ep.name, $ep.port)
   } else {
     Write-Host ("{0,-9} :{1} FAILED（${TimeoutMs}ms 内未就绪，见 $logDir）" -f $ep.name, $ep.port)
@@ -88,7 +129,11 @@ foreach ($ep in $endpoints) {
   }
 }
 
-if ($Status) { exit 0 }
+if ($Status) {
+  # 只报告状态：默认 0；配合 -Strict 时有端点不可用返回 1，便于脚本判定
+  if ($failures -gt 0 -and $Strict) { exit 1 }
+  exit 0
+}
 if ($failures -gt 0 -and $Strict) { exit 1 }
 if ($failures -gt 0) { Write-Warning "有 $failures 个端点未就绪" }
 exit 0
