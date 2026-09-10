@@ -1,0 +1,33 @@
+{
+  "$comment": "Endpoint list: source of relay.js launch args, read by deploy/ensure-proxy.ps1, deploy/install-tasks.ps1 and deploy/probe-subagent.ps1. Keep this file ASCII-only (Windows PowerShell 5.1 reads files as ANSI by default).",
+  "endpoints": [
+    {
+      "name": "deepseek",
+      "port": 18781,
+      "upstream": "https://api.deepseek.com",
+      "codexHome": "~/.codex-deepseek",
+      "baseUrlAfter": "http://127.0.0.1:18781/",
+      "baseUrlOriginal": "https://api.deepseek.com/",
+      "envKey": "DEEPSEEK_API_KEY"
+    },
+    {
+      "name": "glm",
+      "port": 18782,
+      "upstream": "https://open.bigmodel.cn",
+      "codexHome": "~/.codex-glm",
+      "baseUrlAfter": "http://127.0.0.1:18782/api/v1",
+      "baseUrlOriginal": "https://open.bigmodel.cn/api/v1",
+      "envKey": "GLM_API_KEY",
+      "catalogNeedsV2": true
+    },
+    {
+      "name": "kimi",
+      "port": 18783,
+      "upstream": "https://api.kimi.com",
+      "codexHome": "~/.codex-kimi",
+      "baseUrlAfter": "http://127.0.0.1:18783/coding/v1",
+      "baseUrlOriginal": "https://api.kimi.com/coding/v1",
+      "envKey": "KIMI_API_KEY"
+    }
+  ]
+}

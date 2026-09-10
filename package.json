@@ -1,0 +1,25 @@
+{
+  "name": "codex-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本地重写代理：修复 Codex multi-agent v2 在第三方 Responses 兼容端点上的子代理消息投递",
+  "license": "MIT",
+  "main": "relay.js",
+  "bin": {
+    "codex-relay": "relay.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node relay.js",
+    "test": "node --test",
+    "test:watch": "node --test --watch"
+  },
+  "files": [
+    "relay.js",
+    "docs",
+    "deploy",
+    "README.md"
+  ]
+}

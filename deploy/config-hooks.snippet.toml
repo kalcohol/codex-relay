@@ -1,0 +1,18 @@
+# codex-relay：Codex SessionStart hook 片段（兜底拉起代理）
+#
+# 把下面两行合并进 ~/.codex-deepseek、~/.codex-glm、~/.codex-kimi 的 config.toml。
+# 首次触发时 Codex 会请求信任 hook。
+#
+# 说明：
+#   - command_windows 是 hook schema 支持的 Windows 专用字段（config/src/hook_config.rs），
+#     避免通用 command 在 Windows 上走错解释器；
+#   - SessionStart 早于首个模型请求（core/src/session/turn.rs），因此本次会话能等到代理就绪；
+#   - 脚本始终以 0 退出，不会阻塞会话；超时给 10 秒足够探测 + 拉起。
+#   - 若不想用 hook（例如不愿确认信任），只保留常驻服务 + 启动器 ensure 即可。
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File \"<仓库路径>/deploy/ensure-proxy.ps1\""
+command_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File \"<仓库路径>/deploy/ensure-proxy.ps1\""
+timeout = 10
