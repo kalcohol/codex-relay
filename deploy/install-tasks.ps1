@@ -34,6 +34,14 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $supervisor = Join-Path $PSScriptRoot 'supervise-endpoint.ps1'
 $taskPrefix = 'codex-relay'
 
+# 注册计划任务在多数 Windows 配置下需要提权（实测非提权时 Register-ScheduledTask 报 0x80070005）。
+$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+  [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $Uninstall -and -not $elevated) {
+  Write-Warning '当前不是管理员会话：注册计划任务多半会被拒绝（拒绝访问 / 0x80070005）。'
+  Write-Warning '请在“以管理员身份运行”的 PowerShell 里重跑本脚本；或改用 SessionStart hook + 启动器 ensure 两层（见 docs/deploy.md）。'
+}
+
 foreach ($ep in $endpoints) {
   $taskName = "$taskPrefix-$($ep.name)"
   if ($Uninstall) {
@@ -65,9 +73,14 @@ foreach ($ep in $endpoints) {
 
   $description = "codex-relay 常驻代理（$($ep.name) → 127.0.0.1:$($ep.port) → $($ep.upstream)），由 supervise-endpoint.ps1 监督"
 
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
-    -Description $description -Force | Out-Null
-  Write-Host "已注册计划任务 $taskName（登录时启动，失败每分钟重启，时长不限）"
+  try {
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings `
+      -Description $description -Force | Out-Null
+    Write-Host "已注册计划任务 $taskName（登录时启动，失败每分钟重启，时长不限）"
+  } catch {
+    Write-Error ("注册计划任务 $taskName 失败：{0}`n请在管理员 PowerShell 中重跑；若仍失败，改用 SessionStart hook + 启动器 ensure（docs/deploy.md）。" -f $_.Exception.Message)
+    exit 1
+  }
 }
 
 if (-not $Uninstall) {

@@ -58,25 +58,54 @@ function Test-RelayHealthy {
   }
 }
 
-# 单实例：拿不到锁说明已有监督进程（或已有进程正在健康服务），直接退出。
+# 单实例保护。锁文件内容写自己的 PID（便于日志定位），但"是否陈旧"不依赖它：
+# 进程被强杀时文件句柄由系统释放，因此**能重新独占打开 = 原持有者已死**（含旧版本留下的空锁）；
+# 反之打不开就说明确有活着的持有者。这样避免了"陈旧锁要等固定秒数"的启动延迟。
 $lockPath = Join-Path $logDir "$Name.lock"
 $lock = $null
-try {
-  $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-} catch {
+
+function Acquire-Lock {
+  try {
+    $handle = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  } catch {
+    try {
+      $handle = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+      $handle.SetLength(0)
+    } catch {
+      return $null
+    }
+  }
+  $bytes = [System.Text.Encoding]::ASCII.GetBytes("pid=$PID`nstarted=$(Get-Date -Format o)`n")
+  $handle.Write($bytes, 0, $bytes.Length)
+  $handle.Flush()
+  return $handle
+}
+
+function Get-LockOwnerPid {
+  try {
+    $text = [System.IO.File]::ReadAllText($lockPath)
+    if ($text -match 'pid=(\d+)') { return [int]$Matches[1] }
+  } catch { }
+  return $null
+}
+
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+  $lock = Acquire-Lock
+  if ($lock) { break }
+
   if (Test-RelayHealthy -Port $endpoint.port) {
     Write-Log '已有实例在运行（健康检查通过），退出'
     exit 0
   }
-  Write-Log "锁文件被占用但端口 $($endpoint.port) 不健康；等待 5 秒后重试一次"
-  Start-Sleep -Seconds 5
-  if (Test-RelayHealthy -Port $endpoint.port) { exit 0 }
-  try {
-    $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Truncate, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-  } catch {
-    Write-Log '无法取得锁，退出（避免重复拉起）'
-    exit 0
-  }
+  $owner = Get-LockOwnerPid
+  $ownerText = if ($owner) { "pid=$owner" } else { '未知持有者' }
+  Write-Log "锁被 $ownerText 持有但端口 $($endpoint.port) 不健康；等待 2 秒后重试（$attempt/3）"
+  Start-Sleep -Seconds 2
+}
+
+if (-not $lock) {
+  Write-Log '无法取得锁，退出（避免重复拉起）'
+  exit 0
 }
 
 try {
@@ -93,7 +122,8 @@ try {
       -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
     $proc.WaitForExit()
     $uptime = [int]((Get-Date) - $started).TotalSeconds
-    Write-Log "进程退出 code=$($proc.ExitCode) uptime=${uptime}s（日志: $outLog）"
+    $exitCode = if ($null -eq $proc.ExitCode) { 'n/a' } else { $proc.ExitCode }
+    Write-Log "进程退出 code=$exitCode uptime=${uptime}s（日志: $outLog）"
 
     if ($Once) { exit $proc.ExitCode }
 
