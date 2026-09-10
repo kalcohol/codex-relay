@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -251,7 +252,7 @@ test('Authorization 与路径前缀原样转发', async () => {
   }
 });
 
-test('/healthz 返回 200 与计数，且不触上游', async () => {
+test('/healthz 返回 200 与计数，且不触上游、不计入流量', async () => {
   await withRelay(OKEchoJson, { hooks: { A: true, B: true } }, async ({ upstream, relay, port }) => {
     const before = await request(port, { path: '/healthz', method: 'GET' });
     assert.equal(before.status, 200);
@@ -260,7 +261,7 @@ test('/healthz 返回 200 与计数，且不触上游', async () => {
     const after = JSON.parse((await request(port, { path: '/healthz', method: 'GET' })).text);
     assert.equal(after.counters.a_rewrites, 1);
     assert.equal(upstream.requests.length, 1, 'healthz 不得触上游');
-    assert.equal(relay.counters.requests, 3);
+    assert.equal(relay.counters.requests, 1, '探活不应计入 requests（只统计数据面）');
   });
 });
 
@@ -343,6 +344,29 @@ test('归因: 收到 response.completed 后上游关闭连接记为 completed_ab
     await sleep(300);
     assert.equal(relay.counters.errors, 0, JSON.stringify(relay.counters.snapshot()));
     assert.equal(relay.counters.completedAborts, 1);
+  });
+});
+
+test('归因: 客户端中途放弃请求体只记一次 client_abort（请求流报错路径）', async () => {
+  await withRelay(OKEchoJson, { hooks: { A: true, B: true } }, async ({ relay, port }) => {
+    await new Promise((resolve) => {
+      const sock = net.connect(port, '127.0.0.1', () => {
+        // 声明 chunked 却只发一半就 RST：服务端 req 流报错（走 req.on('error') 分支）
+        sock.write(
+          'POST /responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n' +
+            'Transfer-Encoding: chunked\r\n\r\nff\r\n{"partial":',
+        );
+        setTimeout(() => {
+          sock.resetAndDestroy();
+          resolve();
+        }, 100);
+      });
+      sock.on('error', () => {});
+    });
+    await sleep(300);
+    assert.equal(relay.counters.errors, 0, JSON.stringify(relay.counters.snapshot()));
+    assert.equal(relay.counters.clientAborts, 1, '一次中断只能记一次');
+    assert.equal(relay.counters.completedAborts, 0);
   });
 });
 

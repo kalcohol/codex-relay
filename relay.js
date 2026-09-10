@@ -203,7 +203,7 @@ function stripHopByHop(headers) {
 
 class Counters {
   constructor() {
-    this.requests = 0;
+    this.requests = 0; // 数据面请求数（/healthz 探活不计）
     this.aRewrites = 0;
     this.bInjections = 0;
     this.bSkipped = 0; // 因响应压缩或钩子关闭而未注入
@@ -254,7 +254,6 @@ function createRelay(options) {
 
   const server = http.createServer((req, res) => {
     const started = Date.now();
-    counters.requests += 1;
     const seq = capture ? capture.next() : 0;
 
     if (req.method === 'GET' && (req.url === '/healthz' || req.url === '/healthz/')) {
@@ -274,6 +273,13 @@ function createRelay(options) {
       return;
     }
 
+    // 只统计数据面请求：探活（/healthz）与 ensure/监督脚本的探测不计入，
+    // 否则流量视角会被探活污染。
+    counters.requests += 1;
+    // 所有中断路径（客户端断开 / 上游断开 / 请求流错误）都经 recordAbort 归口，
+    // 由 abortCounted 保证一次连接只记一次。
+    const ctx = { seq, started, aRewrites: 0, clientGone: false, completed: false, abortCounted: false };
+
     const chunks = [];
     let size = 0;
     req.on('data', (chunk) => {
@@ -281,7 +287,7 @@ function createRelay(options) {
       size += chunk.length;
     });
     req.on('error', () => {
-      counters.clientAborts += 1;
+      recordAbort(ctx, 'client-gone');
       res.destroy();
     });
     req.on('end', () => {
@@ -312,12 +318,12 @@ function createRelay(options) {
           aRewrites = 0; // 解析失败：原样透传
         }
       }
+      ctx.aRewrites = aRewrites;
       if (body) headers['content-length'] = String(body.length);
 
       if (capture) capture.request(seq, req, headers, body);
 
       const target = buildTarget(origin, req.url);
-      const ctx = { seq, started, aRewrites, clientGone: false, completed: false, abortCounted: false };
       const upstreamReq = transport.request(
         {
           protocol: target.protocol,
@@ -334,25 +340,24 @@ function createRelay(options) {
       );
 
       upstreamReq.on('error', (err) => {
-        const kind = classifyAbort(ctx);
+        const kind = recordAbort(ctx, abortReason(ctx));
         if (kind === 'error') {
-          counters.errors += 1;
           log(`#${seq || '-'} upstream request failed: ${err.message}`);
+          if (!res.headersSent) {
+            const payload = JSON.stringify({
+              error: { message: `codex-relay: upstream request failed: ${err.message}`, type: 'relay_error' },
+            });
+            res.writeHead(502, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
+            res.end(payload);
+            return;
+          }
         }
-        if (!res.headersSent && kind === 'error') {
-          const payload = JSON.stringify({
-            error: { message: `codex-relay: upstream request failed: ${err.message}`, type: 'relay_error' },
-          });
-          res.writeHead(502, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
-          res.end(payload);
-        } else if (!res.writableEnded) {
-          res.destroy();
-        }
+        if (!res.writableEnded) res.destroy();
       });
 
       res.on('close', () => {
         if (!res.writableEnded) {
-          ctx.clientGone = true;
+          recordAbort(ctx, 'client-gone');
           upstreamReq.destroy();
         }
       });
@@ -362,21 +367,32 @@ function createRelay(options) {
     });
   });
 
+  /** 中断时用于判定的原因：已收到 response.completed > 客户端先走 > 真实故障。 */
+  function abortReason(ctx) {
+    if (ctx.completed) return 'after-completed';
+    if (ctx.clientGone) return 'client-gone';
+    return 'error';
+  }
+
   /**
-   * 区分"连接中断"的性质：Codex 主动取消（收齐即断开）与上游在流结束后关闭连接
-   * 都是正常现象，只有客户端仍在等而流断了才算失败（N2：不把正常行为记成故障）。
+   * 中断归口：Codex 主动取消（收齐即断开）与上游在流结束后关闭连接都是正常现象，
+   * 只有客户端仍在等而流断了才算失败（N2：不把正常行为记成故障）。
+   * abortCounted 保证同一次连接只记一次——客户端断开与上游断开是因果关系，
+   * 不设防重入会把一次中断记成两次。
    */
-  function classifyAbort(ctx) {
+  function recordAbort(ctx, reason) {
     if (ctx.abortCounted) return 'counted';
     ctx.abortCounted = true;
-    if (ctx.completed) {
+    if (reason === 'after-completed') {
       counters.completedAborts += 1;
       return 'after-completed';
     }
-    if (ctx.clientGone) {
+    if (reason === 'client-gone') {
+      ctx.clientGone = true;
       counters.clientAborts += 1;
       return 'client-gone';
     }
+    counters.errors += 1;
     return 'error';
   }
 
@@ -403,11 +419,8 @@ function createRelay(options) {
       upstreamRes.pipe(res);
       upstreamRes.on('end', finish);
       upstreamRes.on('error', (err) => {
-        const kind = classifyAbort(ctx);
-        if (kind === 'error') {
-          counters.errors += 1;
-          log(`#${ctx.seq} response stream failed: ${err.message}`);
-        }
+        const kind = recordAbort(ctx, abortReason(ctx));
+        if (kind === 'error') log(`#${ctx.seq} response stream failed: ${err.message}`);
         if (!res.writableEnded) res.destroy();
       });
       return;
@@ -441,11 +454,8 @@ function createRelay(options) {
     }
 
     upstreamRes.on('error', (err) => {
-      const kind = classifyAbort(ctx);
-      if (kind === 'error') {
-        counters.errors += 1;
-        log(`#${ctx.seq} response stream failed: ${err.message}`);
-      }
+      const kind = recordAbort(ctx, abortReason(ctx));
+      if (kind === 'error') log(`#${ctx.seq} response stream failed: ${err.message}`);
       if (!res.writableEnded) res.destroy();
     });
     upstreamRes.on('end', () => {
