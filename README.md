@@ -2,7 +2,13 @@
 
 > 本地重写代理：修复 Codex multi-agent v2 在第三方 Responses 兼容端点（DeepSeek / GLM / Kimi）上的子代理消息投递，零侵入、可随时撤除。
 
-**状态**：方案定稿并经独立源码复核（上游 main `94697375cb`，全部论断逐条证实，见方案 §11）；实现按里程碑推进中（M1 骨架 + 钩子 A → M2 三家验证 → M3 钩子 B → M4 托管部署）。设计方案全文：[docs/plan.md](docs/plan.md)。
+**状态**：实现完成并通过三家真实端点验证（2026-09-11）。代理主体 + 测试 + 部署脚本已落地；DeepSeek / GLM / Kimi 各跑一轮真实 `spawn_agent`，五项断言全部通过（含 kill 韧性测试），见 [docs/verify.md](docs/verify.md)。设计方案全文：[docs/plan.md](docs/plan.md)。
+
+| 文档 | 内容 |
+|---|---|
+| [docs/plan.md](docs/plan.md) | 根因链、源码引证、方案设计、风险表、上游 issue 草稿 |
+| [docs/deploy.md](docs/deploy.md) | 安装、base_url 切换、常驻任务、观测排障、回退卸载 |
+| [docs/verify.md](docs/verify.md) | 验收探针用法、断言判据、实测记录 |
 
 ## 它解决什么问题
 
@@ -38,26 +44,31 @@ Codex CLI ◀──[SSE]──────  钩子 B：给 collaboration functio
 
 ## 环境要求
 
-- Node.js ≥ 18（零第三方依赖，单文件）
+- Node.js ≥ 18（零第三方依赖，单文件 `relay.js`）
 - Codex CLI ≥ 0.147（v2 明文路径自该版本存在；实测基线 0.153.4，0.154.0 复核问题仍在）
-- Kimi 模型目录已标 `"multi_agent_version": "v2"`（`~/.codex-kimi/models.json`；未标会落 v1，每请求带 `tool_search` 即 400）
+- 模型目录标了 `"multi_agent_version": "v2"`：Kimi（`~/.codex-kimi/models.json`）已标；**GLM 需手工补一行**——`~/.codex-glm/models.json` 中 `glm-5.3` 同级加 `"multi_agent_version": "v2",`，未标会落 v1（v1 请求带 `tool_search`，glm-5.3 不会主动用它发现工具，实测两轮失败）
 
 ## 快速开始
 
 ```bash
-# DeepSeek
-node relay.js 18781 https://api.deepseek.com
-# GLM（只填 origin；/api/v1 前缀留在 base_url 里）
-node relay.js 18782 https://open.bigmodel.cn
-# Kimi
-node relay.js 18783 https://api.kimi.com
+# 1) 起代理（每个端点一个进程；监听 127.0.0.1，端口可自定）
+node relay.js 18781 https://api.deepseek.com                  # DeepSeek
+node relay.js 18782 https://open.bigmodel.cn                  # GLM（/api/v1 前缀由 base_url 带过来）
+node relay.js 18783 https://api.kimi.com                      # Kimi
+
+# 2) 把对应 CODEX_HOME 的 base_url 指向本地端口（也可用脚本，见下）
+powershell -NoProfile -File deploy\switch-base-url.ps1 -Apply
+
+# 3) 常驻 + 冒烟
+powershell -NoProfile -File deploy\ensure-proxy.ps1
+curl.exe http://127.0.0.1:18781/healthz
 ```
 
-然后把对应 `CODEX_HOME` 的 `base_url` 指向本地端口（见下表）。API key 照旧放在原环境变量——代理只透传 `Authorization`，不落盘。
+API key 照旧放在原环境变量（`DEEPSEEK_API_KEY` / `GLM_API_KEY` / `KIMI_API_KEY`）——代理只透传，不落盘。
 
 ## 配置
 
-三份 `config.toml` 各改一处 `base_url`：
+三份 `config.toml` 各改一处 `base_url`（`deploy\switch-base-url.ps1` 会自动改并备份）：
 
 | CODEX_HOME | 原值 | 改为 |
 |---|---|---|
@@ -65,53 +76,51 @@ node relay.js 18783 https://api.kimi.com
 | `~/.codex-glm` | `https://open.bigmodel.cn/api/v1` | `http://127.0.0.1:18782/api/v1` |
 | `~/.codex-kimi` | `https://api.kimi.com/coding/v1` | `http://127.0.0.1:18783/coding/v1` |
 
-> Codex 会在 base_url 后追加 `/responses`，**GLM / Kimi 的路径前缀必须保留**。
+> Codex 会在 base_url 后追加 `/responses`，**GLM / Kimi 的路径前缀必须保留**（代理原样转发路径）。
 > 另：不要在家目录运行 codex——项目级 `.codex/config.toml` 会覆盖 `model` 选择（实测踩过）。
+
+端口与上游集中在 [relay.config.json](relay.config.json)，部署脚本都读它。
 
 环境变量（全部可选）：
 
 | 变量 | 作用 |
 |---|---|
 | `CODEX_RELAY_HOOKS` | 钩子开关，默认 `A,B`；如设为 `A` 则只开请求侧 |
-| `CODEX_RELAY_LOG=1` | 输出改写命中计数（升级 Codex 后的回归观测手段） |
+| `CODEX_RELAY_LOG=1` | 逐请求输出状态 / 耗时 / 改写命中计数（升级 Codex 后的回归观测手段） |
 | `CODEX_RELAY_CAPTURE=<dir>` | 抓包落盘，`Authorization` 脱敏；含全量 prompt，仅排障时短时开启 |
 
-健康检查：`GET /healthz` 返回 200，不触上游。
+健康检查：`GET /healthz` 返回 200（不触上游），并给出全部计数。
 
 ## 常驻部署
 
-推荐三层（详见方案 §5）：
+推荐三层（详见 [docs/deploy.md](docs/deploy.md)）：
 
-1. **常驻服务（保底）**：登录自启 / 计划任务，并**必须配置失败自动重启**——三层 ensure 都只在会话启动时触发，会话中途崩溃后的恢复全靠它 + Codex 自身的流重试；
-2. **SessionStart hook（兜底）**：写进三套 `config.toml`，首次需确认信任；
-
-   ```toml
-   [[hooks.SessionStart]]
-   [[hooks.SessionStart.hooks]]
-   type = "command"
-   command_windows = "powershell -NoProfile -File <路径>/ensure-proxy.ps1"
-   timeout = 10
-   ```
-
-3. **启动器 ensure（第三道保险）**：现有 `codex-*.ps1` 加 3–5 行，启动前探测 `/healthz`，不在则拉起。
+1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册计划任务，由 `supervise-endpoint.ps1` 监督——进程退出秒级拉起（实测 1–3 秒），任务自身按分钟级重启兜底，执行时长不限。三层 ensure 都只在会话启动时触发，会话中途崩溃后的恢复全靠它 + Codex 自身的流重试；
+2. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`，首次需确认信任；
+3. **启动器 ensure（第三道保险）**：现有 `codex-*.ps1` 加一行 `ensure-proxy.ps1`，启动前探测 `/healthz`，不在则拉起。
 
 ## 验证
 
-每家各跑一轮：新会话、`--sandbox read-only`、唯一 token。
+```powershell
+# 自动化：临时 CODEX_HOME 跑真实 spawn_agent，核对五项断言（不碰真实配置）
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -Vendor kimi
+```
 
-1. 指令父 agent：`spawn_agent(task_name="probe", message="ZXQ-<VENDOR>-TRACER payload: reply with exactly ECHO-ZXQ-<VENDOR>-TRACER")` → `wait_agent` → 复述子 agent 行为；
-2. 断言一：父 agent 复述子 agent**按 token 回显**（而非"没收到任务"）；
-3. 断言二（A+B）：子线程 rollout 中该消息为明文、`Payload:` 后带正文；
-4. 断言三：全程无 4xx；同会话普通工具调用、非 collab 会话不受影响；
-5. 断言四：修复前的旧会话 `resume` 可用（重点 Kimi 不再 400）；
-6. 断言五：`CODEX_RELAY_LOG=1` 下 A 改写与 B 注入命中计数均 > 0。
-
-**升级 Codex 后重跑本节**——上游若改变 item / SSE 形态，DS/GLM 上的失配是静默的（退回原 bug、无报错），计数是最快的回归探针。
+手工核对与判据见 [docs/verify.md](docs/verify.md)。**升级 Codex 后重跑本节**——上游若改变 item / SSE 形态，DS / GLM 上的失配是静默的（退回原 bug、无报错），`/healthz` 的 A / B 计数是最快的回归探针。
 
 ## 回退与卸载
 
-- 临时回退：`base_url` 改回原值（见上表）即恢复直连；
-- 彻底卸载：停服务 / 计划任务 → 还原三份 `config.toml` → 删除本目录。代理不写任何 Codex 状态，撤除后行为完全回到现状。
+- 临时回退：`powershell -NoProfile -File deploy\switch-base-url.ps1 -Mode direct -Apply`（或手工把 `base_url` 改回原值），立刻恢复直连；
+- 彻底卸载：`install-tasks.ps1 -Uninstall` → 停残留 node 进程 → 还原三份 `config.toml`（去掉 hook 片段）→ 删除本目录。代理不写任何 Codex 状态，撤除后行为完全回到现状。
+
+## 开发
+
+```bash
+npm test        # 43 个用例：改写正确性、SSE 分帧（任意字节边界切片）、压缩透传、
+                # 坏输入失败安全、计数与中断归因（node:test，无第三方依赖）
+```
+
+`/healthz` 的计数是排障的主要手段：`errors` 才是故障，`client_aborts`（Codex 主动断开）与 `completed_aborts`（收到 `response.completed` 后厂商关连接，Kimi 实测如此）都是正常行为。
 
 ## 安全与隐私
 
@@ -124,9 +133,12 @@ node relay.js 18783 https://api.kimi.com
 - 不修 v1 路径在 Kimi 上的 `tool_search` 拒绝（Kimi 统一走 v2 + 钩子 A）；
 - 官方 OpenAI 端点不经代理，行为不变；
 - 仅开 A（无 B）时线上功能正常，但本地 rollout 仍是空信封形态，TUI 回放不可读；
-- 修复依赖上游线格式（`agent_message` item、SSE 事件形态、`encrypted_function_args` 标记语义），大版本升级需复验。
+- 修复依赖上游线格式（`agent_message` item、SSE 事件形态、`encrypted_function_args` 标记语义），大版本升级需复验；
+- 会话中途代理崩溃时，靠监督进程秒级拉起 + Codex 的 `stream_max_retries` 重试窗口，个别在途轮次仍可能失败（断言六已实测 1 秒级恢复）。
 
 ## 文档
 
 - 设计方案（根因链、源码引证、验收标准、风险表、上游 issue 草稿）：[docs/plan.md](docs/plan.md)
+- 部署运维（安装、切换、常驻、排障、回退）：[docs/deploy.md](docs/deploy.md)
+- 验收回归（探针用法、断言判据、实测记录）：[docs/verify.md](docs/verify.md)
 - 证据目录（抓包 / 实验 rollout）：留在本地 `_investigation/` 未随仓库发布（含真实会话内容，方案 §10 有索引）
