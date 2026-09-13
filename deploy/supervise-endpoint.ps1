@@ -123,6 +123,17 @@ if (-not $lock) {
 }
 
 try {
+  # 拿到锁但端口已被服务：说明有个"孤儿" relay 在跑（它的监督进程已经不在了，
+  # 例如被控制台关闭事件连带杀掉、或被杀软清掉）。此时不能退出——否则这个端点
+  # 在孤儿 relay 撑不住时没人接手。留在原地守望，等它倒下立刻接管。
+  if (Test-RelayHealthy -Port $endpoint.port) {
+    Write-Log "端口 $($endpoint.port) 上已有 relay 在服务（非本进程子进程），进入守望：每 30 秒探测，一旦不可用立即接管"
+    while (Test-RelayHealthy -Port $endpoint.port) {
+      Start-Sleep -Seconds 30
+    }
+    Write-Log '既有 relay 已不可用，接管并启动新进程'
+  }
+
   $backoff = 1
   while ($true) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

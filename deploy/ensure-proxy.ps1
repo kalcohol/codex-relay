@@ -64,6 +64,15 @@ function Test-SupervisorAlive {
   }
 }
 
+function Start-Supervisor {
+  param([string]$Name)
+  Start-Process -FilePath 'powershell' `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $supervisor, '-Name', $Name) `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $logDir "$Name-ensure.out.log") `
+    -RedirectStandardError (Join-Path $logDir "$Name-ensure.err.log") | Out-Null
+}
+
 # 停掉正在监听该端口的 relay 进程（监督进程会按自己的节奏把它拉回来）
 function Stop-RelayListener {
   param([int]$Port)
@@ -84,23 +93,40 @@ New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $failures = 0
 foreach ($ep in $endpoints) {
   $healthy = Test-RelayHealthy -Port $ep.port
-  if ($healthy -and -not $Restart) {
-    Write-Host ("{0,-9} :{1} up" -f $ep.name, $ep.port)
+  $supervised = Test-SupervisorAlive -Name $ep.name
+
+  if ($Status) {
+    $note = if ($healthy -and $supervised) { 'up' }
+            elseif ($healthy) { 'up（但无监督进程）' }
+            elseif ($supervised) { 'DOWN（监督进程在跑，疑似正在重启）' }
+            else { 'DOWN（无监督进程）' }
+    Write-Host ("{0,-9} :{1} {2}" -f $ep.name, $ep.port, $note)
+    if (-not $healthy) { $failures += 1 }
     continue
   }
+
+  # 端点健康但没有监督进程：孤儿 relay（监督进程被连带杀掉时会这样）。
+  # 现在能服务不代表以后能——relay 一死就没人接手，所以补一个监督进程；
+  # 它会认出"端口已被服务"并进入守望模式，不抢端口。
+  if ($healthy -and -not $Restart) {
+    if ($supervised) {
+      Write-Host ("{0,-9} :{1} up" -f $ep.name, $ep.port)
+      continue
+    }
+    Write-Host ("{0,-9} :{1} 端点在服务但没有监督进程 → 拉起监督进程接管（守望模式）" -f $ep.name, $ep.port)
+    Start-Supervisor -Name $ep.name
+    # 该进程立即开始守望，无需等端口（已经健康）
+    continue
+  }
+
   if ($Restart -and $healthy) {
     Write-Host ("{0,-9} :{1} 重启：停掉当前 relay 进程，等监督进程拉起新进程" -f $ep.name, $ep.port)
     Stop-RelayListener -Port $ep.port
   }
-  if ($Status) {
-    Write-Host ("{0,-9} :{1} DOWN" -f $ep.name, $ep.port)
-    $failures += 1
-    continue
-  }
 
   # 已在跑的监督进程会自己把 relay 拉回来，等它就够——这里再起一个监督进程
   # 只会和现任争锁，最后报出"未就绪"的假失败。
-  if ($Restart -or (Test-SupervisorAlive -Name $ep.name)) {
+  if ($Restart -or $supervised) {
     # 手动重启会被监督进程当作"快速失败"，退避可能涨到 30s；这里等够一个退避周期。
     $waitMs = if ($Restart) { [Math]::Max($TimeoutMs, 35000) } else { [Math]::Min($TimeoutMs, 6000) }
     if (Wait-RelayHealthy -Port $ep.port -TimeoutMs $waitMs) {
@@ -115,11 +141,7 @@ foreach ($ep in $endpoints) {
   }
 
   Write-Host ("{0,-9} :{1} down → 拉起监督进程" -f $ep.name, $ep.port)
-  Start-Process -FilePath 'powershell' `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $supervisor, '-Name', $ep.name) `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput (Join-Path $logDir "$($ep.name)-ensure.out.log") `
-    -RedirectStandardError (Join-Path $logDir "$($ep.name)-ensure.err.log") | Out-Null
+  Start-Supervisor -Name $ep.name
 
   if (Wait-RelayHealthy -Port $ep.port -TimeoutMs $TimeoutMs) {
     Write-Host ("{0,-9} :{1} up（已启动）" -f $ep.name, $ep.port)

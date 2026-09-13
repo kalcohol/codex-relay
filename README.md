@@ -99,11 +99,12 @@ API key 照旧放在原环境变量（`DEEPSEEK_API_KEY` / `GLM_API_KEY` / `KIMI
 
 ## 常驻部署
 
-推荐三层（详见 [docs/deploy.md](docs/deploy.md)）：
+推荐四层（详见 [docs/deploy.md](docs/deploy.md)）：
 
-1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册计划任务，由 `supervise-endpoint.ps1` 监督——进程退出秒级拉起（实测 1–3 秒），任务自身按分钟级重启兜底，执行时长不限。三层 ensure 都只在会话启动时触发，会话中途崩溃后的恢复全靠它 + Codex 自身的流重试；
-2. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`，首次需确认信任；
-3. **启动器 ensure（第三道保险）**：现有 `codex-*.ps1` 加一行 `ensure-proxy.ps1`，启动前探测 `/healthz`，不在则拉起。
+1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册计划任务，由 `supervise-endpoint.ps1` 监督——进程退出秒级拉起（实测 1–3 秒），执行时长不限；监督进程还会**守望**端口上已有的 relay（孤儿接管，见 [docs/deploy.md](docs/deploy.md) §6.1）；
+2. **看护任务**：同一个脚本注册 `codex-relay-watch`，登录时 + 每 5 分钟跑一次幂等的 `ensure-proxy.ps1`——监督进程若被外部杀掉（实测事故），最多 5 分钟自动补齐；
+3. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`，首次需确认信任；
+4. **启动器 ensure（第三道保险）**：现有 `codex-*.ps1` 加一行 `ensure-proxy.ps1`，启动前探测 `/healthz`，不在则拉起。
 
 ## 验证
 
