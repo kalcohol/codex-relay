@@ -6,8 +6,10 @@
 
 | 项 | 状态 |
 |---|---|
-| 代理进程 | **单进程**（监听 18781/18782/18783 三个端口）；`ensure` 已于 09-13 08:56 修复当日事故 |
-| 常驻方式 | 计划任务 `codex-relay`（登录时 + 每 1 分钟看门狗触发，直接运行 node，无守护进程）——**待管理员执行一次 `install-tasks.ps1` 完成迁移**，在此之前旧的三端点任务仍在跑 |
+| 代理进程 | **单进程**（监听 18781/18782/18783），运行在 **npm 全局安装位置** `%APPDATA%\npm\node_modules\codex-relay`——源码仓库（`E:\projects\develop\forward\codex-relay`）只是开发目录，挪动/删除不影响服务 |
+| 配置 / 日志 | 配置 `%APPDATA%\codex-relay\relay.config.json`（Roaming）；日志 `%LOCALAPPDATA%\codex-relay\logs\relay.log`（Local，5MB 轮转）——Windows 惯例布局 |
+| 常驻方式 | 计划任务 `codex-relay`（登录时 + 每 1 分钟看门狗触发，直接运行 node，无守护进程）——**待管理员执行一次 `install-tasks.ps1` 注册**；当前服务由 ensure 从安装位置手工拉起 |
+| 旧任务清理 | 旧的 `codex-relay-<端点>` 三任务实例已停止（非提权无法卸载注册项），管理员执行 `install-tasks.ps1` 时会自动卸载 |
 | `base_url` | 三份 `CODEX_HOME` 已指向本机代理；原值见下表，配置文件原样备份为 `config.toml.bak-<时间戳>`，另有一份集中备份 `~/codex-relay-backup-20260911/` |
 | 模型目录 | 三家均已标 `multi_agent_version = "v2"`（GLM 由 `patch-catalog-v2.js` 补；DeepSeek 2026-09-11 换模型时用官方新目录，自带 v2，见 §0） |
 | 验收 | 真实配置下三家各跑一轮 `spawn_agent`，探针四项断言（一/二/三/五）全过；断言四（存量会话 resume）与断言六（kill 韧性）手工实测通过；单进程模式经备用端口真实 GLM 探针复验（[verify.md](verify.md) §3） |
@@ -116,15 +118,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -Un
 
 **任务设计**（`codex-relay`，一个任务搞定全部端点）：
 
-- 动作直接运行 `node relay.js --config relay.config.json --log-file <relay.log>`——**没有中间包装进程**，任务实例的生死 = relay 进程的生死，看门狗才能可靠判定；
+- 动作直接运行 `node "<全局安装路径>\relay.js" --config "<Roaming 配置>" --log-file <relay.log>`——**没有中间包装进程**，任务实例的生死 = relay 进程的生死，看门狗才能可靠判定；
+- 路径解析（`install-tasks.ps1` 与 `ensure-proxy.ps1` 同一逻辑）：relay.js 优先 `%APPDATA%\npm\node_modules\codex-relay\relay.js`（`npm install -g .` 的产物），退回仓库内文件；配置优先 `%APPDATA%\codex-relay\relay.config.json`，退回仓库内文件。**源码仓库只是开发目录，挪动/删除不影响服务**；
 - 触发器 = 登录时 + **每 1 分钟重复触发**（10 年有效期）；实例仍活着时被 `MultipleInstances=IgnoreNew` 跳过，进程死亡后由下一次触发拉起（恢复 ≤60 秒）；
 - `ExecutionTimeLimit = 0`（不限时长，否则代理会被默认 3 天限制杀掉）；`StartWhenAvailable`（睡眠错过触发点，醒来补跑）；
 - 日志由 relay 自己写文件（计划任务抓不到 stdout）：`%LOCALAPPDATA%\codex-relay\logs\relay.log`，5MB 自动轮转为 `relay.log.1`；
-- **安装时自动迁移**：停止并卸载旧版任务（`codex-relay-<端点>` / `codex-relay-watch`）、清掉旧的多进程 relay，再注册并启动单进程。重复执行是幂等的。
+- **安装时自动迁移**：停止并卸载旧版任务（`codex-relay-<端点>` / `codex-relay-watch`）、清掉旧 relay 进程，再注册并启动单进程。重复执行是幂等的（等于重启服务）。
+
+**升级**（源码仓库内两步）：
+
+```bash
+git pull && npm install -g .
+powershell -NoProfile -File deploy\ensure-proxy.ps1 -Restart
+```
 
 ## 4. SessionStart hook（可选兜底）
 
-把 [deploy/config-hooks.snippet.toml](../deploy/config-hooks.snippet.toml) 的内容合并进三份 `config.toml`（替换 `<仓库路径>`）。首次触发时 Codex 会请求信任该 hook。不想确认信任就跳过这一层，只用常驻 + 启动器。
+把 [deploy/config-hooks.snippet.toml](../deploy/config-hooks.snippet.toml) 的内容合并进三份 `config.toml`，路径指向**全局安装的** ensure 脚本（`%APPDATA%\npm\node_modules\codex-relay\deploy\ensure-proxy.ps1`；未做全局安装时指向仓库内路径）。首次触发时 Codex 会请求信任该 hook。不想确认信任就跳过这一层，只用常驻 + 启动器。
 
 ## 5. 冒烟与验收
 

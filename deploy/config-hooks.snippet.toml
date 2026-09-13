@@ -1,18 +1,24 @@
 # codex-relay：Codex SessionStart hook 片段（兜底拉起代理）
 #
 # 把下面两行合并进 ~/.codex-deepseek、~/.codex-glm、~/.codex-kimi 的 config.toml。
-# 首次触发时 Codex 会请求信任 hook。
+# 首次触发时 Codex 会请求信任该 hook。
+#
+# 路径说明：优先引用 npm 全局安装的部署（npm install -g . 后的位置，不依赖源码仓库）。
+# 本机实际路径（把 <用户名> 换成实际值，或直接用下面确保脚本里的自动解析）：
+#   C:\Users\<用户名>\AppData\Roaming\npm\node_modules\codex-relay\deploy\ensure-proxy.ps1
+# 未做全局安装时，把路径换成源码仓库内的 deploy\ensure-proxy.ps1 即可——脚本自身
+# 会按"全局安装 → 仓库"的顺序解析 relay.js 与配置。
 #
 # 说明：
 #   - command_windows 是 hook schema 支持的 Windows 专用字段（config/src/hook_config.rs），
 #     避免通用 command 在 Windows 上走错解释器；
 #   - SessionStart 早于首个模型请求（core/src/session/turn.rs），因此本次会话能等到代理就绪；
-#   - 脚本始终以 0 退出，不会阻塞会话；超时给 10 秒足够探测 + 拉起。
-#   - 若不想用 hook（例如不愿确认信任），只保留常驻服务 + 启动器 ensure 即可。
+#   - 脚本始终以 0 退出（除非 -Strict），不会阻塞会话；超时给 10 秒足够探测 + 拉起。
+#   - 若不想用 hook（例如不愿确认信任），只保留计划任务看门狗 + 启动器 ensure 即可。
 
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "powershell -NoProfile -ExecutionPolicy Bypass -File \"<仓库路径>/deploy/ensure-proxy.ps1\""
-command_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File \"<仓库路径>/deploy/ensure-proxy.ps1\""
+command = "powershell -NoProfile -ExecutionPolicy Bypass -File \"<ensure-proxy.ps1 的绝对路径>\""
+command_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File \"<ensure-proxy.ps1 的绝对路径>\""
 timeout = 10

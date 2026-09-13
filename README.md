@@ -50,24 +50,28 @@ Codex CLI ◀──[SSE]──────  钩子 B：给 collaboration functio
 
 ## 当前状态（本机）
 
-- **单进程代理（2026-09-13 起）**：全部端点由一个 relay 进程服务（监听 18781/18782/18783），由计划任务 `codex-relay` 常驻（登录自启 + 每 1 分钟看门狗触发）。**待执行**：管理员运行 `deploy\install-tasks.ps1` 完成迁移（自动卸载旧的三个端点任务并拉起单进程）；
+- **单进程代理 + 全局安装（2026-09-13 起）**：服务运行在 npm 全局安装位置（`%APPDATA%\npm\node_modules\codex-relay`），一个 relay 进程监听 18781/18782/18783，配置在 `%APPDATA%\codex-relay\relay.config.json`，日志在 `%LOCALAPPDATA%\codex-relay\logs\relay.log`——**源码仓库只是开发目录，可随意挪动/删除**；
+- **待执行**：管理员运行 `deploy\install-tasks.ps1` 注册计划任务 `codex-relay`（登录自启 + 每 1 分钟看门狗触发，同时清理旧的三个端点任务）。当前服务由 ensure 手工拉起，功能完整但尚无看门狗；
 - 三份 `CODEX_HOME` 的 `base_url` 已指向本机代理，`config.toml` 备份为 `config.toml.bak-<时间戳>`，另有一份集中备份在 `~/codex-relay-backup-20260911/`；
 - 三家已在真实配置下各跑过一轮 `spawn_agent` 验收，探针四项断言（一/二/三/五）全过；断言四（修复前旧会话 resume）与断言六（kill 韧性）为手工实测，亦通过。详见 [docs/verify.md](docs/verify.md)。
 
 ## 快速开始
 
 ```bash
-# 1) 起代理（单进程，按 relay.config.json 监听全部端点端口）
-node relay.js --config relay.config.json
+# 1) 安装到全局（在仓库内执行；Node 生态的标准位置 %APPDATA%\npm\node_modules\codex-relay）
+npm install -g .
+
+# 2) 配置放 Roaming（首次；之后改端口/上游直接编辑它）
+mkdir "%APPDATA%\codex-relay" && copy relay.config.json "%APPDATA%\codex-relay\"
+
+# 3) 起代理（单进程，监听全部端点端口）
+codex-relay --config "%APPDATA%\codex-relay\relay.config.json"
 
 #    也可以按旧用法每个端点单独起（兼容保留）
 #    node relay.js 18781 https://api.deepseek.com
 
-# 2) 把对应 CODEX_HOME 的 base_url 指向本地端口（也可用脚本，见下）
+# 4) 把对应 CODEX_HOME 的 base_url 指向本地端口（脚本见下），然后冒烟
 powershell -NoProfile -File deploy\switch-base-url.ps1 -Apply
-
-# 3) 常驻 + 冒烟
-powershell -NoProfile -File deploy\ensure-proxy.ps1
 curl.exe http://127.0.0.1:18781/healthz
 ```
 
@@ -86,7 +90,7 @@ API key 照旧放在原环境变量（`DEEPSEEK_API_KEY` / `GLM_API_KEY` / `KIMI
 > Codex 会在 base_url 后追加 `/responses`，**GLM / Kimi 的路径前缀必须保留**（代理原样转发路径）。
 > 另：不要在家目录运行 codex——项目级 `.codex/config.toml` 会覆盖 `model` 选择（实测踩过）。
 
-端口与上游集中在 [relay.config.json](relay.config.json)，部署脚本都读它。
+端口与上游集中在 `relay.config.json`（部署副本在 `%APPDATA%\codex-relay\relay.config.json`，部署脚本按"Roaming → 仓库"顺序解析），改端口/上游后 `ensure-proxy.ps1 -Restart` 生效。
 
 环境变量（全部可选）：
 
@@ -99,15 +103,24 @@ API key 照旧放在原环境变量（`DEEPSEEK_API_KEY` / `GLM_API_KEY` / `KIMI
 
 健康检查：`GET /healthz` 返回 200（不触上游），并给出全部计数。
 
-## 常驻部署
+## 常驻部署 / 升级
 
 推荐三层（详见 [docs/deploy.md](docs/deploy.md)）：
 
-1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册**一个**计划任务 `codex-relay`，直接运行单进程 relay（全部端点）。触发器 = 登录时 + **每 1 分钟重复触发**：任务实例活着就被 `IgnoreNew` 跳过，进程死亡后最多 1 分钟由下一次触发拉起——看门狗就是任务计划本身，**没有任何常驻守护进程**（2026-09-13 架构收敛，监督进程层整体移除，见 [docs/deploy.md](docs/deploy.md) §6.1）；
-2. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`，首次需确认信任；
+1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册**一个**计划任务 `codex-relay`，直接运行**全局安装的** relay（全部端点）。触发器 = 登录时 + **每 1 分钟重复触发**：任务实例活着就被 `IgnoreNew` 跳过，进程死亡后最多 1 分钟由下一次触发拉起——看门狗就是任务计划本身，**没有任何常驻守护进程**（2026-09-13 架构收敛，监督进程层整体移除，见 [docs/deploy.md](docs/deploy.md) §6.1）；
+2. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`（路径指向全局安装的 ensure 脚本），首次需确认信任；
 3. **启动器 ensure（第二道保险）**：现有 `codex-*.ps1` 加一行 `ensure-proxy.ps1`，启动前探测 `/healthz`，不在则拉起。
 
 > 崩溃恢复的取舍：旧架构（监督进程）1–3 秒恢复但要多守护一层；现在 ≤60 秒。会话进行中若恰好崩溃，Codex 的流重试窗口可能不够，该轮需重发。未捕获异常会被代理记录后继续服务（`recovered_errors` 计数），真正的崩溃是罕见事件。
+
+**升级**（源码仓库内）：
+
+```bash
+git pull && npm install -g .
+powershell -NoProfile -File deploy\ensure-proxy.ps1 -Restart   # 秒级切到新版本
+```
+
+部署脚本按"全局安装 → 仓库"的顺序解析 relay.js 与配置，仓库挪位置不影响服务。
 
 ## 验证
 
@@ -121,7 +134,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -V
 ## 回退与卸载
 
 - 临时回退：`powershell -NoProfile -File deploy\switch-base-url.ps1 -Mode direct -Apply`（或手工把 `base_url` 改回原值），立刻恢复直连；
-- 彻底卸载：`install-tasks.ps1 -Uninstall` → 停残留 node 进程 → 还原三份 `config.toml`（去掉 hook 片段）→ 删除本目录。代理不写任何 Codex 状态，撤除后行为完全回到现状。
+- 彻底卸载：`install-tasks.ps1 -Uninstall`（清任务与进程）→ `npm uninstall -g codex-relay`（移除安装）→ 还原三份 `config.toml`（去掉 hook 片段）→ 删除 `%APPDATA%\codex-relay\`（配置）与本仓库。代理不写任何 Codex 状态，撤除后行为完全回到现状。
 
 ## 开发
 

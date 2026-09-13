@@ -26,10 +26,21 @@ param(
 
 $ErrorActionPreference = 'Stop'
 # 注意：$PSScriptRoot 在 param 默认值中不可用（PS 5.1 + CmdletBinding），只能在脚本体内解析。
-if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot '..\relay.config.json' }
 
+# ---- 路径解析：部署不依赖源码仓库的位置（仓库可随意挪动/删除） ----
+# relay.js：优先 npm 全局安装（npm install -g .），退回仓库内文件
+$npmRoot = $null
+try { $npmRoot = (& npm root -g).Trim() } catch { }
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$relayJs = Join-Path $repoRoot 'relay.js'
+$installedRelay = if ($npmRoot) { Join-Path $npmRoot 'codex-relay\relay.js' } else { $null }
+$relayJs = if ($installedRelay -and (Test-Path -LiteralPath $installedRelay)) { $installedRelay } else { Join-Path $repoRoot 'relay.js' }
+
+# relay.config.json：优先 Roaming 配置目录，退回仓库内文件
+$appDataConfig = Join-Path $env:APPDATA 'codex-relay\relay.config.json'
+if (-not $ConfigPath) {
+  $ConfigPath = if (Test-Path -LiteralPath $appDataConfig) { $appDataConfig } else { Join-Path $repoRoot 'relay.config.json' }
+}
+
 $taskName = 'codex-relay'
 $legacyTaskNames = @('codex-relay-deepseek', 'codex-relay-glm', 'codex-relay-kimi', 'codex-relay-watch')
 $logDir = Join-Path $env:LOCALAPPDATA 'codex-relay\logs'
@@ -45,6 +56,8 @@ if (-not $elevated) {
 $null = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConfigPath), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) { throw 'PATH 中找不到 node（需要 Node.js >= 18）' }
+Write-Host ("relay.js : {0}" -f $relayJs)
+Write-Host ("config   : {0}" -f $ConfigPath)
 
 function Remove-Legacy {
   foreach ($name in $legacyTaskNames) {
@@ -54,10 +67,11 @@ function Remove-Legacy {
       Write-Host "已卸载旧版任务 $name"
     }
   }
-  # 旧多进程形态的 relay（命令行以端口号开头）；新任务尚未启动，此刻存在即属旧进程
+  # 停止任何仍在跑的 relay 进程：此刻新任务尚未启动，存在的都属旧进程；
+  # 重复执行安装脚本时这一步等于重启服务（随后会以新任务拉起）。
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
     Where-Object { $_.CommandLine -match 'relay\.js' } |
-    ForEach-Object { Write-Host "停止旧 relay 进程 pid=$($_.ProcessId)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    ForEach-Object { Write-Host "停止 relay 进程 pid=$($_.ProcessId)"; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 if ($Uninstall) {
@@ -67,17 +81,19 @@ if ($Uninstall) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
     Write-Host "已卸载计划任务 $taskName"
   }
+  Write-Host '提示：全局安装的包仍在（npm uninstall -g codex-relay 可移除）；配置在 %APPDATA%\codex-relay\，日志在 %LOCALAPPDATA%\codex-relay\，需要可手动删除。'
   exit 0
 }
 
-if (-not (Test-Path -LiteralPath $relayJs)) { throw "找不到 $relayJs" }
+if (-not (Test-Path -LiteralPath $relayJs)) { throw "找不到 $relayJs（先在仓库执行 npm install -g . 安装，或检查 npm root -g）" }
 Remove-Legacy
 
 # 动作直接运行 node：没有中间包装进程，任务实例的生死 = relay 进程的生死，
 # 看门狗（重复触发）才能可靠判定。日志由 relay 自己写文件（计划任务抓不到 stdout）。
+# WorkingDirectory 指向 relay.js 所在目录（全局安装包内），不依赖仓库位置。
 $action = New-ScheduledTaskAction -Execute $node.Source `
   -Argument ('"{0}" --config "{1}" --log-file "{2}"' -f $relayJs, $ConfigPath, $logFile) `
-  -WorkingDirectory $repoRoot
+  -WorkingDirectory (Split-Path -Parent $relayJs)
 
 $triggers = @(
   (if ($AtStartup) { New-ScheduledTaskTrigger -AtStartup } else { New-ScheduledTaskTrigger -AtLogOn }),

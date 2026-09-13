@@ -29,15 +29,23 @@ param(
 
 $ErrorActionPreference = 'Stop'
 # 注意：$PSScriptRoot 在 param 默认值中不可用（PS 5.1 + CmdletBinding），只能在脚本体内解析。
-if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot '..\relay.config.json' }
+
+# ---- 路径解析：部署不依赖源码仓库的位置（仓库可随意挪动/删除） ----
+$npmRoot = $null
+try { $npmRoot = (& npm root -g).Trim() } catch { }
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$installedRelay = if ($npmRoot) { Join-Path $npmRoot 'codex-relay\relay.js' } else { $null }
+$relayJs = if ($installedRelay -and (Test-Path -LiteralPath $installedRelay)) { $installedRelay } else { Join-Path $repoRoot 'relay.js' }
+$appDataConfig = Join-Path $env:APPDATA 'codex-relay\relay.config.json'
+if (-not $ConfigPath) {
+  $ConfigPath = if (Test-Path -LiteralPath $appDataConfig) { $appDataConfig } else { Join-Path $repoRoot 'relay.config.json' }
+}
 
 # PS 5.1 默认按 ANSI 读文件，中文注释会变乱码并破坏 JSON 解析，必须显式 UTF-8。
 $cfg = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConfigPath), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
 $endpoints = $cfg.endpoints
 if ($Only) { $endpoints = $endpoints | Where-Object { $Only -contains $_.name } }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$relayJs = Join-Path $repoRoot 'relay.js'
 $taskName = 'codex-relay'
 $logDir = Join-Path $env:LOCALAPPDATA 'codex-relay\logs'
 $logFile = Join-Path $logDir 'relay.log'
