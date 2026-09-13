@@ -1,21 +1,7 @@
 # 部署与运维
 
-面向本机使用者。设计方案见 [plan.md](plan.md) §5；验收流程见 [verify.md](verify.md)。
-
-## 本机当前状态（2026-09-13 更新）
-
-| 项 | 状态 |
-|---|---|
-| 代理进程 | **单进程**（监听 18781/18782/18783），运行在 **npm 全局安装位置** `%APPDATA%\npm\node_modules\codex-relay`——源码仓库（`E:\projects\develop\forward\codex-relay`）只是开发目录，挪动/删除不影响服务 |
-| 配置 / 日志 | 配置 `%APPDATA%\codex-relay\relay.config.json`（Roaming）；日志 `%LOCALAPPDATA%\codex-relay\logs\relay.log`（Local，5MB 轮转）——Windows 惯例布局 |
-| 常驻方式 | 计划任务 `codex-relay`（登录时 + 每 1 分钟看门狗触发，直接运行 node，无守护进程）——**待管理员执行一次 `install-tasks.ps1` 注册**；当前服务由 ensure 从安装位置手工拉起 |
-| 旧任务清理 | 旧的 `codex-relay-<端点>` 三任务实例已停止（非提权无法卸载注册项），管理员执行 `install-tasks.ps1` 时会自动卸载 |
-| `base_url` | 三份 `CODEX_HOME` 已指向本机代理；原值见下表，配置文件原样备份为 `config.toml.bak-<时间戳>`，另有一份集中备份 `~/codex-relay-backup-20260911/` |
-| 模型目录 | 三家均已标 `multi_agent_version = "v2"`（GLM 由 `patch-catalog-v2.js` 补；DeepSeek 2026-09-11 换模型时用官方新目录，自带 v2，见 §0） |
-| 验收 | 真实配置下三家各跑一轮 `spawn_agent`，探针四项断言（一/二/三/五）全过；断言四（存量会话 resume）与断言六（kill 韧性）手工实测通过；单进程模式经备用端口真实 GLM 探针复验（[verify.md](verify.md) §3） |
-| Codex 版本 | 0.154.0 |
-
-回退见 §7（一条命令恢复直连）。以下为各部分的操作细节。
+面向本机使用者的运行簿：前置检查 → 安装/常驻 → 观测排障 → 回退卸载。
+设计方案见 [plan.md](plan.md) §5；验收流程见 [verify.md](verify.md)；版本演进见 [CHANGELOG.md](CHANGELOG.md)。
 
 三层分工（第 1 层必需）：
 
@@ -25,7 +11,11 @@
 | SessionStart hook | 兜底：会话开始前探测并拉起 | 会话启动 |
 | 启动器 ensure（可选） | 第二道保险：`.ps1` 启动器内先 ensure | 手动启动 |
 
-> 架构说明（2026-09-13 收敛）：以前是"3 relay + 3 监督进程 + 看护任务"共 6 个常驻进程。实测发现监督进程会被外部事件整体带走（§6.1 事故），且任务级 RestartCount 对"启动后被杀"不生效——与其修监督层，不如把监督职责交给任务计划程序本身：**动作直接运行 node，每 1 分钟重复触发，实例活着就跳过、死了就拉起**。代价是崩溃恢复从 1–3 秒变为 ≤60 秒；未捕获异常由代理记录后继续服务（`recovered_errors`），真正崩溃是罕见事件。
+> 架构与取舍：常驻形态是"**单进程 relay**（全部端点）+ 任务计划看门狗"——动作直接运行 node，任务实例
+> 的生死 = 进程生死，实例活着触发被跳过、死了拉起，因此**不需要任何常驻守护进程**。代价是崩溃恢复
+> ≤60 秒（监督进程形态可到 1–3 秒但需多守护一层，且监督进程自身也会死，见 §6.1 事故）；未捕获异常由
+> 代理记录后继续服务（`recovered_errors`），真正崩溃是罕见事件。部署位置与源码仓库解耦：服务运行在
+> npm 全局安装目录，仓库只是开发目录（§3 的路径解析）。
 
 ## 0. 前置检查
 
@@ -216,3 +206,18 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='no
 ```
 
 代理不写任何 Codex 状态，撤除后行为完全回到现状。
+
+## 附录 A：本机部署快照
+
+> 快照日期 2026-09-13。这是一次实际部署的留档，供对照排障；重装/换机时以各章节流程为准。
+
+| 项 | 状态 |
+|---|---|
+| 计划任务 | `codex-relay` **Running**（登录时 + 每 1 分钟看门狗触发）；动作 = `node.exe "<APPDATA>\npm\node_modules\codex-relay\relay.js" --config "<APPDATA>\codex-relay\relay.config.json" --log-file "<LOCALAPPDATA>\codex-relay\logs\relay.log"` |
+| 代理进程 | 单进程（一个 pid 服务 18781 / 18782 / 18783），运行于 npm 全局安装位置；旧的三端点任务已卸载 |
+| 配置 / 日志 | `%APPDATA%\codex-relay\relay.config.json`（Roaming）；`%LOCALAPPDATA%\codex-relay\logs\relay.log`（Local，5MB 轮转） |
+| `base_url` | 三份 `CODEX_HOME` 指向本机代理；原值备份为各目录 `config.toml.bak-<时间戳>`，另有集中备份 `~/codex-relay-backup-20260911/` |
+| 模型目录 | 三家均带 `multi_agent_version = "v2"`（GLM 由 `patch-catalog-v2.js` 补；DeepSeek 用 2026-09-11 官方新目录，自带 v2，见 §0） |
+| 验收 | 真实配置下三家各一轮 `spawn_agent`，探针四项断言（一/二/三/五）全过；断言四（存量会话 resume）与断言六（kill 韧性）手工实测通过（[verify.md](verify.md) §3） |
+| Codex 版本 | 0.154.0 |
+| 遗留备份 | `~/codex-relay-backup-20260911/`（config.toml / models.json 三家 + DeepSeek 换模型后副本）——服务稳定运行一段时间后可清 |
