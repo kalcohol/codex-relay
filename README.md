@@ -191,6 +191,7 @@ npm uninstall -g codex-relay
 | [docs/verify.md](docs/verify.md) | 验收回归：探针用法、断言判据、实测记录 |
 | [docs/manual-test.md](docs/manual-test.md) | 手工速测：可粘贴的 prompt 与判读 |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | 版本演进 |
+| [docs/research-opencode-v2-provider.md](docs/research-opencode-v2-provider.md) | 调查：OpenCode v2 多 provider 机制（fusion 的 know-how） |
 
 ## 许可证
 
