@@ -65,3 +65,54 @@
 - 调查产物不改变任何现有部署；OpenCode 本身也可与 Codex 并存（独立工具、独立配置）；
 - 若未来引入 OpenCode 作为对照/备选客户端，其 DeepSeek/GLM/Kimi 走各自原生协议，**不经过** codex-relay——
   互不影响。
+
+---
+
+## 6. Subagents：OpenCode v2 与 Codex 的思路对比
+
+| 维度 | Codex multi-agent v2 | OpenCode v2 |
+|---|---|---|
+| 子代理模型 | 角色可绑 model，但 **provider 硬继承父会话**（跨厂商必须网关） | `agent.model = {providerID, modelID}`，**任意厂商**；`agent.model ?? parent.model`（subagent.ts:150） |
+| 任务传递 | InterAgentCommunication 信封（NEW_TASK/MESSAGE/FINAL_ANSWER）；第三方端点需钩子 A/B 修复 | **纯文本 prompt** 作为子会话首条 user 消息，前缀 "You are a subagent spawned by another session."（subagent.ts:176） |
+| 上下文继承 | `fork_turns` 可继承父历史（all/none） | 默认**全新上下文**，prompt 要求自带全部背景；无 fork 机制 |
+| 持续对话 | 子线程常驻 + send_message / followup_task / wait_agent 邮箱模型 | `sessionID` 续聊（工具输出带子会话 id，再次调用即继续）；可 `switchModel` 换子会话模型（:140） |
+| 后台执行 | 子线程后台 + wait_agent 阻塞 | `background=true` 立即返回 + job 完成自动通知（subagent-job.ts） |
+| 嵌套 | 允许（4 并发槽） | **默认禁止**（`experimental.subagent_depth` 默认 1，:94） |
+| 权限 | 全局 approval / sandbox | **per-agent permission ruleset**（allow/ask/deny，agent.ts Info） |
+| 声明方式 | `~/.codex/agents/*.toml` 或 `[agents.*]` | `{agent,agents}/**/*.md`（frontmatter：model/description/permissions/prompt）+ config |
+| 线格式风险 | 第三方端点需钩子修复，升级需复验 | 明文，无此风险 |
+| 失败隔离 | 线程报错可毒化父会话（Kimi 修复前） | ToolFailure 保留 sessionID 供继续，隔离较好 |
+
+两个哲学差异值得记住：OpenCode 要求 prompt 自带背景（无继承），Codex 提供 fork；OpenCode 默认不嵌套，
+Codex 允许。前者让跨厂商天然安全（没有 opaque 内容穿越），后者是产品选择而非线格式约束。
+
+## 7. 是否值得整体切换到 OpenCode v2？
+
+**支持面（对本机需求逐项对照，全绿）**：
+
+- 三家国产全部内置：`deepseek`（OpenAI Chat 协议）、`moonshot`（Kimi：OpenAI Chat / **Anthropic Messages** / **OpenResponses** 三条路由）、`zai` + `zai-coding-plan`（GLM，正是本机在用的 coding plan 端点）；
+- **GPT 订阅也原生**：`core/src/plugin/provider/openai.ts` 实现 ChatGPT OAuth（browser/headless，PKCE）直连
+  `chatgpt.com/backend-api/codex`，`originator: "opencode"`（不冒充 Codex）、`x-codex-beta-features: remote_compaction_v2`、
+  responses WS 能力开启、订阅模型门控与限额对齐 Codex CLI（context 400k / input 272k）——统一方案的全部 FR
+  （含 GPT）在这里是**原生能力**，连 Phase 2 都省了；
+- 多 provider 单会话、per-agent 模型、跨厂商 spawn：原生；agent 用 Markdown 声明，frontmatter 即配置；
+- skills、websearch、MCP、LSP、细粒度 permissions；Windows：install 脚本支持 windows-x64。
+
+**成本与风险**：
+
+- **v2.0.3 发布于 2026-09-12（一天前）**——v2.0.x 早期，坑未暴露完；
+- TUI/工作流迁移成本：配置体系、审批模型（permission ask/allow vs Codex 的 approvals + Windows sandbox）、
+  status line 等习惯都要重学；AGENTS.md 大体通用但格式有差异；
+- Codex 特有资产无对应：guardian、approvals_reviewer、既有 rollout 历史、codex exec 自动化与验收脚本；
+- 用 OpenCode 走 ChatGPT 订阅属于"第三方客户端访问订阅"——它用自有 originator 且随上游策略维护模型允许清单
+  （2026-08-31 就发生过 gpt-5.4 系进出），存在被策略变化影响的可能；
+- subagent 无 fork 继承、嵌套默认禁用——依赖"子代理带父上下文"的用法需要改习惯。
+
+**建议**：
+
+1. **并行试用，不做替换**：安装 v2（windows-x64），ChatGPT 登录 + 三家 key，拿一个非关键项目真实跑一周。
+   重点观察：Windows TUI 体验、权限弹窗频率、跨厂商 subagent 的委派质量、长会话稳定性；
+2. **判定标准**：试用通过 → 新工作逐步迁到 OpenCode（多厂商协同主力），Codex + relay 保留给存量流程与
+   codex exec 自动化（两者共存零冲突）；试用不通过 → 回 Codex，fusion Phase 1 网关设计已就绪可随时启动；
+3. **直接完全弃用 Codex 现在不建议**：v2 太新 + 迁移成本 + 订阅策略风险。但无论试用结果如何，
+   fusion 网关都可以安全搁置——"多厂商同会话"这个问题已经由另一个客户端在协议层原生解决了。
