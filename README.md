@@ -53,8 +53,16 @@ Codex CLI ◀──SSE────────────────┤ 钩子
 
 ## 快速开始
 
-前置：Node.js ≥ 18；Codex CLI ≥ 0.147；模型目录已标 `multi_agent_version = "v2"`
+前置：Node.js ≥ 18；模型目录已标 `multi_agent_version = "v2"`
 （三家现状与补标记脚本见 [docs/deploy.md §0](docs/deploy.md)）。
+
+**Codex CLI 版本支持**（2026-09-13 对 npm 各发布版本二进制逐一实证，标记矩阵见 [docs/deploy.md §0](docs/deploy.md)）：
+
+| Codex 版本 | 支持情况 |
+|---|---|
+| **≥ 0.147.0** | ✅ 完整（钩子 A + B）。实测：0.147.0 / 0.150.0 / 0.153.4 / 0.154.0 |
+| 0.138.0 – 0.146.x | ❌ 不受支持：钩子 B 依赖的明文标记（`encrypted_function_args`）不存在；0.146.1 实跑验收失败（子代理误继承父指令连锁派生，非代理问题但不可用） |
+| < 0.138.0 | ❌ v2 语义不存在（encrypted relay 于 0.138.0 引入），钩子无从谈起 |
 
 ```bash
 # 1) 安装到全局（在仓库内执行；运行位置与源码仓库解耦）

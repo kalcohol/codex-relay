@@ -59,6 +59,8 @@ Select-String -Path "$env:LOCALAPPDATA\codex-relay\verify\<vendor>\home\sessions
 
 第二轮（真实配置切换后，`-RealHome`）：三家探针四项断言同样全过（A / B 增量各 2；Kimi 另有 2 次正常的 `completed_aborts`）。产物见 `%LOCALAPPDATA%\codex-relay\verify\<vendor>\report-realhome.txt`。
 
+第三轮（2026-09-13，Codex 版本边界实证，DeepSeek 探针）：把 npm 发布的历史版本二进制拉到临时目录，替换 PATH 后实跑——**0.147.0 四项断言全过（A=2 / B=2，rollout 明文）**，确立支持下界；**0.146.1 验收失败**（钩子 A 计数正常、全程无 4xx，但子代理误继承父指令连锁派生触发 `agent thread limit reached`——该版本子代理上下文行为问题，非代理缺陷）。结合对 0.137.0–0.154.0 六个版本的二进制标记矩阵（`encrypted_function_args` 自 0.147.0 出现），支持范围定为 **≥ 0.147.0**，矩阵见 [deploy.md §0](deploy.md)。
+
 **断言四（R3，存量会话）**：取修复前 400 的 Kimi 会话（`_investigation/exp-kimi-v2/home/sessions/2026/09/10/rollout-2026-09-10T22-13-48-01a08baa-e75f-….jsonl`，其 `task_complete` 事件留有 `input.10: item type "agent_message" is not supported` 的现场），复制进临时 CODEX_HOME（base_url 指向抓包代理）后 `codex exec resume <父会话 id>`：
 
 - 结果：退出码 0，模型正常回复，`errors=0`（修复前该请求必然 400）；

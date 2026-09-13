@@ -21,15 +21,33 @@
 
 ```powershell
 node --version              # >= 18
-codex --version             # >= 0.147（实测 0.154.0）
+codex --version             # >= 0.147.0（版本支持矩阵见下）
 curl.exe http://127.0.0.1:18781/healthz   # 未部署时应连接失败
 ```
 
-模型目录要求 `multi_agent_version = "v2"`（否则落 v1）：
+### Codex CLI 版本支持矩阵（2026-09-13 实证）
+
+对 npm 发布的各版本 Windows 二进制（`@openai/codex@<v>-win32-x64`）做标记检测 + 边界版本实跑。
+钩子 B 依赖的明文标记 `encrypted_function_args` 于 **0.147.0** 才出现（对应上游 #35845）：
+
+| 版本 | `multi_agent_version` | `agent_message` | `encrypted_function_args` | 结论 |
+|---|---|---|---|---|
+| 0.137.0 | 1 | 10 | **0** | v2 语义未引入，不支持 |
+| 0.138.0 | 8 | 38 | **0** | v2 引入（#26210），但无明文路径，不支持 |
+| 0.146.1 | 27 | 55 | **0** | 明文标记仍不存在；**实跑验收失败**（子代理误继承父指令连锁派生触发 thread limit——非代理问题：A 计数正常、全程无 4xx），不支持 |
+| 0.147.0 | 23 | 54 | **21** | ✅ 实跑探针四项断言全过（A=2 / B=2） |
+| 0.150.0 | 25 | 54 | 24 | ✅ 标记齐备 |
+| 0.154.0 | 20 | 44 | 22 | ✅ 实测（真实配置全量验收） |
+
+结论：**受支持范围 ≥ 0.147.0**（0.147.0 / 0.150.0 / 0.153.4 / 0.154.0 有实测或标记实证）；0.138–0.146 因缺明文标记且 0.146.1 实跑不可用而不受支持。升级 Codex 后跑一次探针看 A / B 计数即可回归。
+
+### 模型目录要求
+
+`multi_agent_version = "v2"`（否则落 v1）：
 
 | 端点 | 现状（2026-09-11 实测） |
 |---|---|
-| DeepSeek | 官方目录自带：`deepseek-flash` / `deepseek-v4-pro` 均带 `"multi_agent_version": "v2"` |
+| DeepSeek | 官方目录自带：`deepseek-flash` / `deepseek-v4-pro` 均带 `"multi_agent_version": "v2"`（条目另要求 `minimal_client_version ≥ 0.144.0`，被版本下限覆盖） |
 | Kimi | `~/.codex-kimi/models.json` 的 `k3` / `k3-256k` 已带 |
 | GLM | **原本缺失，已用脚本补上**：`glm-5.3` / `glm-5-turbo` 均补了 `"multi_agent_version": "v2"`（写入前已备份） |
 
