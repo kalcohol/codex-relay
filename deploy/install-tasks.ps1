@@ -95,12 +95,13 @@ $action = New-ScheduledTaskAction -Execute $node.Source `
   -Argument ('"{0}" --config "{1}" --log-file "{2}"' -f $relayJs, $ConfigPath, $logFile) `
   -WorkingDirectory (Split-Path -Parent $relayJs)
 
-$triggers = @(
-  (if ($AtStartup) { New-ScheduledTaskTrigger -AtStartup } else { New-ScheduledTaskTrigger -AtLogOn }),
-  # 看门狗：每分钟触发一次；实例仍活着则被 IgnoreNew 跳过，死了则拉起新实例
-  (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-      -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650))
-)
+# 注意：不要写 @( (if ...) , ... ) —— 圆括号表达式里的 if 能通过语法解析，
+# 却在运行时被当作命令名（PS 5.1 实测）；"$x = if ..."（赋值取语句值）才是合法形态。
+$logonTrigger = if ($AtStartup) { New-ScheduledTaskTrigger -AtStartup } else { New-ScheduledTaskTrigger -AtLogOn }
+# 看门狗：每分钟触发一次；实例仍活着则被 IgnoreNew 跳过，死了则拉起新实例
+$watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+  -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)
+$triggers = @($logonTrigger, $watchdogTrigger)
 
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -StartWhenAvailable -MultipleInstances IgnoreNew `
