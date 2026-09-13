@@ -1,23 +1,27 @@
 ﻿<#
 .SYNOPSIS
-  确保 codex-relay 各端点代理在运行（幂等、快速返回）。
+  确保 codex-relay 单进程代理在运行（幂等、快速返回）。
 .DESCRIPTION
-  供三种入口复用（见 docs/plan.md §5.2）：
-    1. Codex SessionStart hook（首次需信任）——兜底；
-    2. codex-*.ps1 启动器——第三道保险；
-    3. 手工运维 / 排障。
-  逐端点探测 GET /healthz，不健康则拉起监督进程（supervise-endpoint.ps1）并等待就绪。
-  默认始终以退出码 0 结束（避免 hook 阻塞会话）；需要严格判定时加 -Strict。
+  单进程架构（docs/deploy.md §3）：一个进程监听全部端点端口；计划任务
+  codex-relay 以"登录时 + 每 1 分钟重复触发"充当看门狗。
+
+  本脚本的行为：
+    - 全部端点健康：只打印状态即返回（无副作用）；
+    - 有端点不健康：优先通过计划任务修复（任务未运行则启动；任务在运行但
+      端口仍未就绪则强制换血：结束 node 进程后再次启动任务）；没有注册任务
+      时退回直接拉起 node（hook / 手工场景）；
+    - -Restart：结束当前 relay 进程并立即重新拉起（比等看门狗快）；
+    - -Status：只报告，不改动；配合 -Strict，有端点不健康时退出码 1。
 .EXAMPLE
   powershell -NoProfile -File deploy\ensure-proxy.ps1
 .EXAMPLE
-  powershell -NoProfile -File deploy\ensure-proxy.ps1 -Status
+  powershell -NoProfile -File deploy\ensure-proxy.ps1 -Status -Strict
 #>
 [CmdletBinding()]
 param(
   [string]$ConfigPath,
   [string[]]$Only,
-  [int]$TimeoutMs = 8000,
+  [int]$TimeoutMs = 20000,
   [switch]$Status,
   [switch]$Strict,
   [switch]$Restart
@@ -26,6 +30,17 @@ param(
 $ErrorActionPreference = 'Stop'
 # 注意：$PSScriptRoot 在 param 默认值中不可用（PS 5.1 + CmdletBinding），只能在脚本体内解析。
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot '..\relay.config.json' }
+
+# PS 5.1 默认按 ANSI 读文件，中文注释会变乱码并破坏 JSON 解析，必须显式 UTF-8。
+$cfg = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConfigPath), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+$endpoints = $cfg.endpoints
+if ($Only) { $endpoints = $endpoints | Where-Object { $Only -contains $_.name } }
+
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$relayJs = Join-Path $repoRoot 'relay.js'
+$taskName = 'codex-relay'
+$logDir = Join-Path $env:LOCALAPPDATA 'codex-relay\logs'
+$logFile = Join-Path $logDir 'relay.log'
 
 function Test-RelayHealthy {
   param([int]$Port, [int]$TimeoutMs = 1500)
@@ -38,124 +53,108 @@ function Test-RelayHealthy {
   }
 }
 
-# 轮询等待就绪（监督进程接管通常 1–3 秒）
-function Wait-RelayHealthy {
-  param([int]$Port, [int]$TimeoutMs)
+function Get-RelayTask {
+  Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+}
+
+# 单进程模式下任意一个监听端口的进程就是 relay 本体
+function Get-RelayPid {
+  param([int[]]$Ports)
+  $conn = Get-NetTCPConnection -LocalPort $Ports -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($conn) { return $conn.OwningProcess }
+  return $null
+}
+
+function Wait-Healthy {
+  param([object[]]$Endpoints, [int]$TimeoutMs)
   $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
   while ((Get-Date) -lt $deadline) {
-    if (Test-RelayHealthy -Port $Port -TimeoutMs 1000) { return $true }
+    $down = @($Endpoints | Where-Object { -not (Test-RelayHealthy -Port $_.port -TimeoutMs 1000) })
+    if ($down.Count -eq 0) { return $true }
     Start-Sleep -Milliseconds 250
   }
   return $false
 }
 
-# 判断该端点是否已有活着的监督进程：锁文件被独占说明持有者还活着，
-# 能独占打开则说明持有者已死（与 supervise-endpoint.ps1 同一判据）。
-function Test-SupervisorAlive {
-  param([string]$Name)
-  $lockPath = Join-Path $logDir "$Name.lock"
-  if (-not (Test-Path -LiteralPath $lockPath)) { return $false }
-  try {
-    $handle = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-    $handle.Dispose()
-    return $false
-  } catch {
-    return $true
-  }
+function Start-RelayProcess {
+  # 无计划任务时的退路（hook / 手工场景）：直接拉起单进程，日志由 relay 自写文件
+  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+  $args = '"{0}" --config "{1}" --log-file "{2}"' -f $relayJs, $ConfigPath, $logFile
+  Start-Process -FilePath 'node' -ArgumentList $args -WorkingDirectory $repoRoot -WindowStyle Hidden | Out-Null
 }
 
-function Start-Supervisor {
-  param([string]$Name)
-  Start-Process -FilePath 'powershell' `
-    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $supervisor, '-Name', $Name) `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput (Join-Path $logDir "$Name-ensure.out.log") `
-    -RedirectStandardError (Join-Path $logDir "$Name-ensure.err.log") | Out-Null
+function Stop-RelayProcesses {
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+    Where-Object { $_.CommandLine -match 'relay\.js' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
-# 停掉正在监听该端口的 relay 进程（监督进程会按自己的节奏把它拉回来）
-function Stop-RelayListener {
-  param([int]$Port)
-  $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-  foreach ($c in $conn) { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue }
-}
-
-# PS 5.1 默认按 ANSI 读文件，中文注释会变乱码并破坏 JSON 解析，必须显式 UTF-8。
-$cfg = [System.IO.File]::ReadAllText((Resolve-Path -LiteralPath $ConfigPath), [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-$endpoints = $cfg.endpoints
-if ($Only) { $endpoints = $endpoints | Where-Object { $Only -contains $_.name } }
-
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$supervisor = Join-Path $PSScriptRoot 'supervise-endpoint.ps1'
-$logDir = Join-Path $env:LOCALAPPDATA 'codex-relay\logs'
-New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-$failures = 0
-foreach ($ep in $endpoints) {
-  $healthy = Test-RelayHealthy -Port $ep.port
-  $supervised = Test-SupervisorAlive -Name $ep.name
-
-  if ($Status) {
-    $note = if ($healthy -and $supervised) { 'up' }
-            elseif ($healthy) { 'up（但无监督进程）' }
-            elseif ($supervised) { 'DOWN（监督进程在跑，疑似正在重启）' }
-            else { 'DOWN（无监督进程）' }
-    Write-Host ("{0,-9} :{1} {2}" -f $ep.name, $ep.port, $note)
-    if (-not $healthy) { $failures += 1 }
-    continue
-  }
-
-  # 端点健康但没有监督进程：孤儿 relay（监督进程被连带杀掉时会这样）。
-  # 现在能服务不代表以后能——relay 一死就没人接手，所以补一个监督进程；
-  # 它会认出"端口已被服务"并进入守望模式，不抢端口。
-  if ($healthy -and -not $Restart) {
-    if ($supervised) {
-      Write-Host ("{0,-9} :{1} up" -f $ep.name, $ep.port)
-      continue
-    }
-    Write-Host ("{0,-9} :{1} 端点在服务但没有监督进程 → 拉起监督进程接管（守望模式）" -f $ep.name, $ep.port)
-    Start-Supervisor -Name $ep.name
-    # 该进程立即开始守望，无需等端口（已经健康）
-    continue
-  }
-
-  if ($Restart -and $healthy) {
-    Write-Host ("{0,-9} :{1} 重启：停掉当前 relay 进程，等监督进程拉起新进程" -f $ep.name, $ep.port)
-    Stop-RelayListener -Port $ep.port
-  }
-
-  # 已在跑的监督进程会自己把 relay 拉回来，等它就够——这里再起一个监督进程
-  # 只会和现任争锁，最后报出"未就绪"的假失败。
-  if ($Restart -or $supervised) {
-    # 手动重启会被监督进程当作"快速失败"，退避可能涨到 30s；这里等够一个退避周期。
-    $waitMs = if ($Restart) { [Math]::Max($TimeoutMs, 35000) } else { [Math]::Min($TimeoutMs, 6000) }
-    if (Wait-RelayHealthy -Port $ep.port -TimeoutMs $waitMs) {
-      Write-Host ("{0,-9} :{1} up（监督进程已拉起）" -f $ep.name, $ep.port)
-      continue
-    }
-    if (Test-SupervisorAlive -Name $ep.name) {
-      Write-Host ("{0,-9} :{1} 未就绪，但监督进程在运行（可能正在退避重启，见 $logDir）" -f $ep.name, $ep.port)
-      $failures += 1
-      continue
-    }
-  }
-
-  Write-Host ("{0,-9} :{1} down → 拉起监督进程" -f $ep.name, $ep.port)
-  Start-Supervisor -Name $ep.name
-
-  if (Wait-RelayHealthy -Port $ep.port -TimeoutMs $TimeoutMs) {
-    Write-Host ("{0,-9} :{1} up（已启动）" -f $ep.name, $ep.port)
-  } else {
-    Write-Host ("{0,-9} :{1} FAILED（${TimeoutMs}ms 内未就绪，见 $logDir）" -f $ep.name, $ep.port)
-    $failures += 1
-  }
+$ports = @($endpoints | ForEach-Object { $_.port })
+$states = foreach ($ep in $endpoints) {
+  [pscustomobject]@{ name = $ep.name; port = $ep.port; up = (Test-RelayHealthy -Port $ep.port) }
 }
 
 if ($Status) {
-  # 只报告状态：默认 0；配合 -Strict 时有端点不可用返回 1，便于脚本判定
+  $task = Get-RelayTask
+  $taskState = if ($task) { $task.State } else { '未注册' }
+  foreach ($s in $states) {
+    Write-Host ("{0,-9} :{1} {2}" -f $s.name, $s.port, $(if ($s.up) { 'up' } else { 'DOWN' }))
+  }
+  Write-Host ("任务 {0}: {1}" -f $taskName, $taskState)
+  $failures = @($states | Where-Object { -not $_.up }).Count
   if ($failures -gt 0 -and $Strict) { exit 1 }
   exit 0
 }
-if ($failures -gt 0 -and $Strict) { exit 1 }
-if ($failures -gt 0) { Write-Warning "有 $failures 个端点未就绪" }
+
+if ($Restart) {
+  Write-Host "重启：结束当前 relay 进程并立即重新拉起"
+  Stop-RelayProcesses
+  if (Get-RelayTask) { Start-ScheduledTask -TaskName $taskName }
+  else { Start-RelayProcess }
+  if (Wait-Healthy -Endpoints $endpoints -TimeoutMs ([Math]::Max($TimeoutMs, 15000))) {
+    foreach ($s in $states) { Write-Host ("{0,-9} :{1} up（已重启）" -f $s.name, $s.port) }
+    exit 0
+  }
+  Write-Warning '重启后仍有端点未就绪（看门狗会在 1 分钟内再试；详见日志）'
+  exit 1
+}
+
+$down = @($states | Where-Object { -not $_.up })
+if ($down.Count -eq 0) {
+  foreach ($s in $states) { Write-Host ("{0,-9} :{1} up" -f $s.name, $s.port) }
+  exit 0
+}
+
+$task = Get-RelayTask
+$repaired = $false
+if ($task) {
+  if ($task.State -ne 'Running') {
+    Write-Host "有端点不健康且任务未运行 → 启动任务 $taskName"
+    Start-ScheduledTask -TaskName $taskName
+    $repaired = Wait-Healthy -Endpoints $endpoints -TimeoutMs $TimeoutMs
+  }
+  if (-not $repaired) {
+    # 任务实例在跑但端口仍未就绪：node 可能僵死或启动早期失败，强制换血
+    Write-Host "任务在运行但端点仍未就绪 → 结束 node 进程后重启任务"
+    Stop-RelayProcesses
+    Start-ScheduledTask -TaskName $taskName
+    $repaired = Wait-Healthy -Endpoints $endpoints -TimeoutMs $TimeoutMs
+  }
+} else {
+  Write-Host "有端点不健康且未注册任务 $taskName → 直接拉起 relay 进程"
+  Start-RelayProcess
+  $repaired = Wait-Healthy -Endpoints $endpoints -TimeoutMs $TimeoutMs
+}
+
+foreach ($s in $states) {
+  $up = if ($repaired) { $true } else { Test-RelayHealthy -Port $s.port }
+  Write-Host ("{0,-9} :{1} {2}" -f $s.name, $s.port, $(if ($up) { 'up' } else { 'DOWN' }))
+}
+$stillDown = @($states | Where-Object { -not (Test-RelayHealthy -Port $_.port) })
+if ($stillDown.Count -gt 0) {
+  Write-Warning "有 $($stillDown.Count) 个端点未就绪（日志: $logFile）"
+  if ($Strict) { exit 1 }
+} elseif ($repaired) {
+  Write-Host '已修复。'
+}
 exit 0

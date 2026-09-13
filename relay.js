@@ -193,6 +193,69 @@ function redactHeaders(headers) {
   return out;
 }
 
+// ------------------------------------------------------------------ 进程级健康
+
+// uncaughtException / unhandledRejection 被崩溃容忍处理器接住后在这里累加；
+// healthz 暴露它，非零说明进程发生过被吞掉的异常（应查日志）。
+const processHealth = { recoveredErrors: 0 };
+
+// ------------------------------------------------------------------ 文件日志
+
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * 追加式文件日志，超过 maxBytes 轮转为 <file>.1（保留一代）。
+ * 计划任务抓不到 stdout，常驻模式下必须落文件。
+ */
+function createFileLogger(filePath, maxBytes = LOG_MAX_BYTES) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  let stream = fs.createWriteStream(filePath, { flags: 'a' });
+  let bytes = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+  let rotating = false;
+  const pending = []; // 轮转期间的写入缓冲，避免 write-after-end
+
+  const logger = {
+    write(line) {
+      if (rotating) {
+        pending.push(line);
+        return;
+      }
+      const data = line + '\n';
+      bytes += Buffer.byteLength(data);
+      stream.write(data);
+      if (bytes > maxBytes) {
+        rotating = true;
+        stream.end(() => {
+          try {
+            fs.renameSync(filePath, filePath + '.1');
+          } catch {
+            /* 被占用等场景：放弃本次轮转，下次再试 */
+          }
+          stream = fs.createWriteStream(filePath, { flags: 'a' });
+          bytes = 0;
+          rotating = false;
+          const queued = pending.splice(0);
+          for (const item of queued) logger.write(item);
+        });
+      }
+    },
+    close() {
+      try {
+        stream.end();
+      } catch {
+        /* 忽略 */
+      }
+    },
+  };
+  return logger;
+}
+
+function logLine(logger, consoleOut, prefix, args) {
+  const line = [prefix, ...args].join(' ');
+  if (consoleOut) console.log(line);
+  if (logger) logger.write(`${new Date().toISOString()} ${line}`);
+}
+
 function stripHopByHop(headers) {
   const out = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -262,6 +325,8 @@ function createRelay(options) {
         name,
         upstream: origin,
         hooks,
+        pid: process.pid,
+        recovered_errors: processHealth.recoveredErrors,
         counters: counters.snapshot(),
       });
       res.writeHead(200, {
@@ -335,9 +400,13 @@ function createRelay(options) {
           agent,
         },
         (upstreamRes) => {
+          if (process.env.CODEX_RELAY_TRACE === '1') console.error(`[trace] #${seq || '-'} upstream responded ${upstreamRes.statusCode}`);
           handleResponse(upstreamRes, res, ctx);
         },
       );
+      if (process.env.CODEX_RELAY_TRACE === '1') {
+        console.error(`[trace] #${seq || '-'} upstream request created → ${target.href}`);
+      }
 
       upstreamReq.on('error', (err) => {
         const kind = recordAbort(ctx, abortReason(ctx));
@@ -474,6 +543,8 @@ function createRelay(options) {
     counters,
     host,
     port,
+    name,
+    upstream: origin,
     listen() {
       return new Promise((resolve, reject) => {
         server.once('error', reject);
@@ -558,18 +629,79 @@ function writeFile(target, contents) {
 
 // ------------------------------------------------------------------ 启动
 
+/**
+ * 多端口模式：一个进程按 relay.config.json 的 endpoints 起全部监听口。
+ * 每个端点仍是独立的 createRelay 实例（独立 counters / hooks 配置不变），
+ * 只是共享同一个进程、同一份日志与同一个崩溃域——由计划任务的重复触发
+ * 充当看门狗（见 docs/deploy.md §3）。
+ * 任一端口绑定失败即整体失败退出（fail-fast，看门狗会带退避重试）。
+ */
+async function startRelayFromConfig({ configPath, host, log, logger, hooks, capture }) {
+  const raw = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '');
+  const cfg = JSON.parse(raw);
+  const endpoints = Array.isArray(cfg.endpoints) ? cfg.endpoints : [];
+  if (endpoints.length === 0) throw new Error('config has no endpoints');
+
+  const relays = [];
+  const failures = [];
+  for (const ep of endpoints) {
+    const relay = createRelay({
+      port: ep.port,
+      origin: ep.upstream,
+      host,
+      name: ep.name,
+      hooks,
+      log,
+      capture,
+    });
+    try {
+      await relay.listen();
+      relays.push(relay);
+    } catch (err) {
+      failures.push(`${ep.name}(:${ep.port}): ${err.message}`);
+    }
+  }
+  if (failures.length > 0) {
+    for (const relay of relays) await relay.close().catch(() => {});
+    throw new Error(`failed to listen — ${failures.join('; ')}`);
+  }
+  return {
+    relays,
+    close: async () => {
+      for (const relay of relays) await relay.close().catch(() => {});
+      if (logger) logger.close();
+    },
+  };
+}
+
 function usage() {
   return [
-    'usage: node relay.js <port> <upstream-origin> [--host 127.0.0.1] [--name <label>]',
+    'usage: node relay.js <port> <upstream-origin> [options]   # 单端点（兼容旧用法）',
+    '       node relay.js --config relay.config.json [options] # 多端口单进程（推荐常驻）',
     '',
-    '  port             listen port on the loopback interface',
-    '  upstream-origin  e.g. https://api.deepseek.com (path prefix is preserved)',
+    'options:',
+    '  --host 127.0.0.1   listen address (default loopback)',
+    '  --name <label>     log label (single-endpoint mode)',
+    '  --log-file <path>  append logs to file with 5MB rotation',
+    '                     (also CODEX_RELAY_LOGFILE; Task Scheduler cannot capture stdout)',
     '',
     'env:',
     '  CODEX_RELAY_HOOKS=A,B     hooks to enable (default A,B)',
     '  CODEX_RELAY_LOG=1         print per-request rewrite counters',
     '  CODEX_RELAY_CAPTURE=<dir> capture requests/responses (Authorization redacted)',
   ].join('\n');
+}
+
+/** 崩溃容忍：记录后继续服务。无状态代理可安全这样做；真正的僵死由看门狗兜底。 */
+function installCrashTolerance(log) {
+  process.on('uncaughtException', (err) => {
+    processHealth.recoveredErrors += 1;
+    log(`uncaughtException #${processHealth.recoveredErrors} (kept alive):`, err && err.stack);
+  });
+  process.on('unhandledRejection', (reason) => {
+    processHealth.recoveredErrors += 1;
+    log(`unhandledRejection #${processHealth.recoveredErrors} (kept alive):`, reason && (reason.stack || String(reason)));
+  });
 }
 
 function main(argv) {
@@ -579,6 +711,8 @@ function main(argv) {
     const arg = argv[i];
     if (arg === '--host') opts.host = argv[++i];
     else if (arg === '--name') opts.name = argv[++i];
+    else if (arg === '--config') opts.config = argv[++i];
+    else if (arg === '--log-file') opts.logFile = argv[++i];
     else if (arg === '--help' || arg === '-h') {
       console.log(usage());
       return 0;
@@ -588,6 +722,44 @@ function main(argv) {
     } else positional.push(arg);
   }
 
+  const hooks = parseHooks(process.env.CODEX_RELAY_HOOKS);
+  const wantLog = process.env.CODEX_RELAY_LOG === '1' || process.env.CODEX_RELAY_LOG === 'true';
+  const captureDir = process.env.CODEX_RELAY_CAPTURE;
+  const logFile = opts.logFile || process.env.CODEX_RELAY_LOGFILE || null;
+
+  // ---- 多端口单进程模式 ----
+  if (opts.config) {
+    const logger = logFile ? createFileLogger(logFile) : null;
+    const log = (...args) => logLine(logger, wantLog, '[relay]', args);
+    installCrashTolerance((...args) => logLine(logger, true, '[relay]', args));
+    const capture = captureDir ? createCapture(captureDir) : null;
+
+    startRelayFromConfig({ configPath: opts.config, host: opts.host, log, logger, hooks, capture })
+      .then((multi) => {
+        for (const relay of multi.relays) {
+          const addr = relay.server.address();
+          log(`listening on http://${addr.address}:${addr.port} → ${relay.upstream} (endpoint: ${relay.name})`);
+        }
+        log(
+          `hooks: ${[hooks.A ? 'A' : null, hooks.B ? 'B' : null].filter(Boolean).join(',') || 'none'}` +
+            `${captureDir ? `, capture: ${captureDir}` : ''}${logFile ? `, log: ${logFile}` : ''}`,
+        );
+        const shutdown = () => {
+          log('shutting down');
+          multi.close().then(() => process.exit(0));
+          setTimeout(() => process.exit(0), 3000).unref();
+        };
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+      })
+      .catch((err) => {
+        logLine(logger, true, '[relay]', [`fatal: ${err.message}`]);
+        process.exit(1);
+      });
+    return 0;
+  }
+
+  // ---- 单端点模式（兼容旧用法）----
   const port = Number.parseInt(positional[0], 10);
   const origin = positional[1];
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -606,12 +778,11 @@ function main(argv) {
     return 2;
   }
 
-  const hooks = parseHooks(process.env.CODEX_RELAY_HOOKS);
-  const wantLog = process.env.CODEX_RELAY_LOG === '1' || process.env.CODEX_RELAY_LOG === 'true';
-  const captureDir = process.env.CODEX_RELAY_CAPTURE;
+  const logger = logFile ? createFileLogger(logFile) : null;
   const name = opts.name || `relay:${port}`;
   const logPrefix = `[${name}]`;
-  const log = wantLog ? (...args) => console.log(logPrefix, ...args) : () => {};
+  const log = (...args) => logLine(logger, wantLog || !logger, logPrefix, args);
+  installCrashTolerance((...args) => logLine(logger, true, logPrefix, args));
 
   const relay = createRelay({
     port,
@@ -627,13 +798,13 @@ function main(argv) {
     .listen()
     .then((address) => {
       const enabled = [hooks.A ? 'A' : null, hooks.B ? 'B' : null].filter(Boolean).join(',') || 'none';
-      console.log(
-        `${logPrefix} listening on http://${address.address}:${address.port} → ${parsedOrigin.origin} ` +
-          `(hooks: ${enabled}${captureDir ? `, capture: ${captureDir}` : ''})`,
-      );
+      const msg =
+        `listening on http://${address.address}:${address.port} → ${parsedOrigin.origin} ` +
+        `(hooks: ${enabled}${captureDir ? `, capture: ${captureDir}` : ''}${logFile ? `, log: ${logFile}` : ''})`;
+      log(msg);
     })
     .catch((err) => {
-      console.error(`${logPrefix} failed to listen: ${err.message}`);
+      logLine(logger, true, logPrefix, [`failed to listen: ${err.message}`]);
       process.exit(1);
     });
 
@@ -657,11 +828,14 @@ module.exports = {
   patchSseFrame,
   createSsePatcher,
   createRelay,
+  startRelayFromConfig,
+  createFileLogger,
   createCapture,
   parseHooks,
   buildTarget,
   stripHopByHop,
   redactHeaders,
+  processHealth,
   COLLAB_TOOLS,
   MAX_FRAME_BYTES,
 };

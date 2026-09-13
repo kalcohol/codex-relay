@@ -74,13 +74,15 @@ if ($RealHome) {
 } else {
 # --- 1) 临时 CODEX_HOME：改 base_url、模型目录路径，并补 v2 标记 -----------------
 $config = [System.IO.File]::ReadAllText((Join-Path $realHomeDir 'config.toml'), [System.Text.Encoding]::UTF8)
-if ($config.Contains($ep.baseUrlOriginal)) {
-  $config = $config.Replace($ep.baseUrlOriginal, $ep.baseUrlAfter)
-  Write-Step "temp home: base_url 由直连改为 $($ep.baseUrlAfter)"
-} elseif ($config.Contains($ep.baseUrlAfter)) {
+# 无论真实配置当前指向直连还是某个代理端口，统一把 provider 的 base_url 换成目标值
+$baseUrlPattern = '(?m)^(?<indent>\s*)base_url\s*=\s*"(?<url>[^"]*)"'
+$m = [regex]::Match($config, $baseUrlPattern)
+if (-not $m.Success) { throw 'config.toml 里找不到 base_url（手动改过？）' }
+if ($m.Groups['url'].Value -eq $ep.baseUrlAfter) {
   Write-Step "temp home: 真实配置已指向 $($ep.baseUrlAfter)，副本沿用"
 } else {
-  throw "config.toml 里既没有 $($ep.baseUrlOriginal) 也没有 $($ep.baseUrlAfter)（手动改过？）"
+  $config = $config.Substring(0, $m.Groups['url'].Index) + $ep.baseUrlAfter + $config.Substring($m.Groups['url'].Index + $m.Groups['url'].Length)
+  Write-Step "temp home: base_url $($m.Groups['url'].Value) → $($ep.baseUrlAfter)"
 }
 
 $model = ([regex]::Match($config, 'model\s*=\s*"([^"]+)"')).Groups[1].Value

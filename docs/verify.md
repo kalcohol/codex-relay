@@ -47,7 +47,7 @@ Select-String -Path "$env:LOCALAPPDATA\codex-relay\verify\<vendor>\home\sessions
 
 ## 3. 实测记录
 
-**环境**：Windows 11，**Codex CLI 0.154.0**（`codex --version`；方案 §6.2 要求升级后复验，本轮即为 0.154.0 下的结果），Node v24.15.0，本机代理（hooks A+B 全开）。
+**环境**：Windows 11，**Codex CLI 0.154.0**（`codex --version`；方案 §6.2 要求升级后复验，本轮即为 0.154.0 下的结果），Node v24.15.0，本机代理（hooks A+B 全开）。2026-09-13 起代理为**单进程多端口**形态——收敛当日以备用端口配置（同一上游、28781-28783）复跑 GLM 全链路探针，四项断言全过（`docs/deploy.md` §3 的架构说明）。
 
 第一轮（临时 CODEX_HOME，隔离验证）：
 

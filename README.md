@@ -50,17 +50,18 @@ Codex CLI ◀──[SSE]──────  钩子 B：给 collaboration functio
 
 ## 当前状态（本机）
 
-- 三个端点代理已按计划任务常驻（`codex-relay-deepseek` / `-glm` / `-kimi`，登录自启 + 失败重启 + 进程退出秒级拉起）；
+- **单进程代理（2026-09-13 起）**：全部端点由一个 relay 进程服务（监听 18781/18782/18783），由计划任务 `codex-relay` 常驻（登录自启 + 每 1 分钟看门狗触发）。**待执行**：管理员运行 `deploy\install-tasks.ps1` 完成迁移（自动卸载旧的三个端点任务并拉起单进程）；
 - 三份 `CODEX_HOME` 的 `base_url` 已指向本机代理，`config.toml` 备份为 `config.toml.bak-<时间戳>`，另有一份集中备份在 `~/codex-relay-backup-20260911/`；
 - 三家已在真实配置下各跑过一轮 `spawn_agent` 验收，探针四项断言（一/二/三/五）全过；断言四（修复前旧会话 resume）与断言六（kill 韧性）为手工实测，亦通过。详见 [docs/verify.md](docs/verify.md)。
 
 ## 快速开始
 
 ```bash
-# 1) 起代理（每个端点一个进程；监听 127.0.0.1，端口可自定）
-node relay.js 18781 https://api.deepseek.com                  # DeepSeek
-node relay.js 18782 https://open.bigmodel.cn                  # GLM（/api/v1 前缀由 base_url 带过来）
-node relay.js 18783 https://api.kimi.com                      # Kimi
+# 1) 起代理（单进程，按 relay.config.json 监听全部端点端口）
+node relay.js --config relay.config.json
+
+#    也可以按旧用法每个端点单独起（兼容保留）
+#    node relay.js 18781 https://api.deepseek.com
 
 # 2) 把对应 CODEX_HOME 的 base_url 指向本地端口（也可用脚本，见下）
 powershell -NoProfile -File deploy\switch-base-url.ps1 -Apply
@@ -93,18 +94,20 @@ API key 照旧放在原环境变量（`DEEPSEEK_API_KEY` / `GLM_API_KEY` / `KIMI
 |---|---|
 | `CODEX_RELAY_HOOKS` | 钩子开关，默认 `A,B`；如设为 `A` 则只开请求侧 |
 | `CODEX_RELAY_LOG=1` | 逐请求输出状态 / 耗时 / 改写命中计数（升级 Codex 后的回归观测手段） |
+| `CODEX_RELAY_LOGFILE=<path>` | 日志落盘（追加，5MB 轮转 `.1`）；也可用 `--log-file` 参数。计划任务抓不到 stdout，常驻模式靠它 |
 | `CODEX_RELAY_CAPTURE=<dir>` | 抓包落盘，`Authorization` 脱敏；含全量 prompt，仅排障时短时开启 |
 
 健康检查：`GET /healthz` 返回 200（不触上游），并给出全部计数。
 
 ## 常驻部署
 
-推荐四层（详见 [docs/deploy.md](docs/deploy.md)）：
+推荐三层（详见 [docs/deploy.md](docs/deploy.md)）：
 
-1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册计划任务，由 `supervise-endpoint.ps1` 监督——进程退出秒级拉起（实测 1–3 秒），执行时长不限；监督进程还会**守望**端口上已有的 relay（孤儿接管，见 [docs/deploy.md](docs/deploy.md) §6.1）；
-2. **看护任务**：同一个脚本注册 `codex-relay-watch`，登录时 + 每 5 分钟跑一次幂等的 `ensure-proxy.ps1`——监督进程若被外部杀掉（实测事故），最多 5 分钟自动补齐；
-3. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`，首次需确认信任；
-4. **启动器 ensure（第三道保险）**：现有 `codex-*.ps1` 加一行 `ensure-proxy.ps1`，启动前探测 `/healthz`，不在则拉起。
+1. **常驻（保底）**：`deploy\install-tasks.ps1`（**需管理员 PowerShell**）注册**一个**计划任务 `codex-relay`，直接运行单进程 relay（全部端点）。触发器 = 登录时 + **每 1 分钟重复触发**：任务实例活着就被 `IgnoreNew` 跳过，进程死亡后最多 1 分钟由下一次触发拉起——看门狗就是任务计划本身，**没有任何常驻守护进程**（2026-09-13 架构收敛，监督进程层整体移除，见 [docs/deploy.md](docs/deploy.md) §6.1）；
+2. **SessionStart hook（兜底）**：把 [deploy/config-hooks.snippet.toml](deploy/config-hooks.snippet.toml) 合并进三套 `config.toml`，首次需确认信任；
+3. **启动器 ensure（第二道保险）**：现有 `codex-*.ps1` 加一行 `ensure-proxy.ps1`，启动前探测 `/healthz`，不在则拉起。
+
+> 崩溃恢复的取舍：旧架构（监督进程）1–3 秒恢复但要多守护一层；现在 ≤60 秒。会话进行中若恰好崩溃，Codex 的流重试窗口可能不够，该轮需重发。未捕获异常会被代理记录后继续服务（`recovered_errors` 计数），真正的崩溃是罕见事件。
 
 ## 验证
 
@@ -123,11 +126,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -V
 ## 开发
 
 ```bash
-npm test        # 43 个用例：改写正确性、SSE 分帧（任意字节边界切片）、压缩透传、
-                # 坏输入失败安全、计数与中断归因（node:test，无第三方依赖）
+npm test        # 47 个用例：改写正确性、SSE 分帧（任意字节边界切片）、压缩透传、
+                # 坏输入失败安全、计数与中断归因、多端口单进程与日志轮转（node:test，无第三方依赖）
 ```
 
-`/healthz` 的计数是排障的主要手段：`errors` 才是故障，`client_aborts`（Codex 主动断开）与 `completed_aborts`（收到 `response.completed` 后厂商关连接，Kimi 实测如此）都是正常行为。
+`/healthz` 的计数是排障的主要手段：`errors` 才是故障，`client_aborts`（Codex 主动断开）与 `completed_aborts`（收到 `response.completed` 后厂商关连接，Kimi 实测如此）都是正常行为；`recovered_errors` 非零说明进程吞过未捕获异常（查日志）。
 
 ## 安全与隐私
 

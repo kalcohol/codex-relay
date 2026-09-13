@@ -6,25 +6,24 @@
 
 | 项 | 状态 |
 |---|---|
-| 代理进程 | 三个端点各一个 relay + 一个监督进程（`ensure` 已于 09-13 08:56 恢复并接管孤儿 relay） |
+| 代理进程 | **单进程**（监听 18781/18782/18783 三个端口）；`ensure` 已于 09-13 08:56 修复当日事故 |
+| 常驻方式 | 计划任务 `codex-relay`（登录时 + 每 1 分钟看门狗触发，直接运行 node，无守护进程）——**待管理员执行一次 `install-tasks.ps1` 完成迁移**，在此之前旧的三端点任务仍在跑 |
 | `base_url` | 三份 `CODEX_HOME` 已指向本机代理；原值见下表，配置文件原样备份为 `config.toml.bak-<时间戳>`，另有一份集中备份 `~/codex-relay-backup-20260911/` |
 | 模型目录 | 三家均已标 `multi_agent_version = "v2"`（GLM 由 `patch-catalog-v2.js` 补；DeepSeek 2026-09-11 换模型时用官方新目录，自带 v2，见 §0） |
-| 验收 | 真实配置下三家各跑一轮 `spawn_agent`，探针四项断言（一/二/三/五）全过；断言四（存量会话 resume）与断言六（kill 韧性）手工实测通过（[verify.md](verify.md) §3） |
+| 验收 | 真实配置下三家各跑一轮 `spawn_agent`，探针四项断言（一/二/三/五）全过；断言四（存量会话 resume）与断言六（kill 韧性）手工实测通过；单进程模式经备用端口真实 GLM 探针复验（[verify.md](verify.md) §3） |
 | Codex 版本 | 0.154.0 |
-| **待办** | 需以**管理员**身份执行一次 `install-tasks.ps1 -WatchOnly` 注册看护任务（见 §6.1），否则"监督进程被杀"仍会静默失守 |
 
 回退见 §7（一条命令恢复直连）。以下为各部分的操作细节。
 
-四层的分工（前两层是必需的）：
+三层分工（第 1 层必需）：
 
 | 层 | 作用 | 覆盖时机 |
 |---|---|---|
-| 常驻（计划任务 + 监督进程） | 保底：登录即起，进程退出立刻重启 | 全入口、登录后全时段 |
-| **看护任务（每 5 分钟 ensure）** | 兜底：**监督进程**被外部杀掉后自动补齐 | 登录后全时段，不依赖登录事件 |
+| **计划任务 `codex-relay`（看门狗）** | 保底：登录即起；进程死亡后最多 1 分钟由重复触发拉起 | 全入口、登录后全时段 |
 | SessionStart hook | 兜底：会话开始前探测并拉起 | 会话启动 |
-| 启动器 ensure（可选） | 第三道保险：`.ps1` 启动器内先 ensure | 手动启动 |
+| 启动器 ensure（可选） | 第二道保险：`.ps1` 启动器内先 ensure | 手动启动 |
 
-> 端点任务与 hook 都只在**会话/登录启动时**触发；会话中途 relay 崩溃由监督进程 1 秒级拉起，而"监督进程自己被杀"只有看护任务能兜住（实测事故见 §6.1）。
+> 架构说明（2026-09-13 收敛）：以前是"3 relay + 3 监督进程 + 看护任务"共 6 个常驻进程。实测发现监督进程会被外部事件整体带走（§6.1 事故），且任务级 RestartCount 对"启动后被杀"不生效——与其修监督层，不如把监督职责交给任务计划程序本身：**动作直接运行 node，每 1 分钟重复触发，实例活着就跳过、死了就拉起**。代价是崩溃恢复从 1–3 秒变为 ≤60 秒；未捕获异常由代理记录后继续服务（`recovered_errors`），真正崩溃是罕见事件。
 
 ## 0. 前置检查
 
@@ -106,21 +105,22 @@ powershell -NoProfile -File deploy\switch-base-url.ps1 -Mode direct -Apply   # �
 
 > Codex 会在 `base_url` 后追加 `/responses`，GLM / Kimi 的路径前缀必须保留（代理按原样转发路径）。
 
-## 3. 常驻计划任务
+## 3. 常驻计划任务（单进程 + 看门狗）
 
-> **需要管理员权限**：注册计划任务在非提权会话中会被拒绝（`0x80070005`，实测如此）。请在"以管理员身份运行"的 PowerShell 中执行。没有管理员权限时，用 §4 的 hook + §1 的 ensure 两层即可（少了"重启后自动拉起"，需要每次登录后跑一次 ensure）——脚本会先检查并提示。
+> **需要管理员权限**：注册计划任务在非提权会话中会被拒绝（`0x80070005`，实测如此）。请在"以管理员身份运行"的 PowerShell 中执行。没有管理员权限时，用 §4 的 hook + §1 的 ensure 两层即可——ensure 会退回直接拉起 node。
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1              # 注册端点任务 + 看护任务
-powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -Only kimi    # 只注册一个端点任务
-powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -WatchOnly    # 只补看护任务（不动已有端点任务）
-powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -Uninstall    # 卸载（含看护任务）
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1     # 注册并启动（自动迁移旧任务）
+powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -Uninstall
 ```
 
-任务参数（`install-tasks.ps1` 内固定）：
+**任务设计**（`codex-relay`，一个任务搞定全部端点）：
 
-- 端点任务 `codex-relay-<端点>`：`ExecutionTimeLimit = 0`（不限时长，否则代理会被默认 3 天限制杀掉）、`RestartCount = 999` + `RestartInterval = 1 分钟`、`MultipleInstances = IgnoreNew`、`-AtLogOn`（任务在用户会话内运行，无需存密码；需要未登录也运行时加 `-AtStartup`）。
-- 看护任务 `codex-relay-watch`：登录时 + 每 5 分钟执行 `ensure-proxy.ps1`（幂等：健康时只做一次探活），用来兜住"监督进程被外部杀掉"——实测任务级 `RestartCount` 对"进程已启动后被终止"并不生效（见 §6.1）。
+- 动作直接运行 `node relay.js --config relay.config.json --log-file <relay.log>`——**没有中间包装进程**，任务实例的生死 = relay 进程的生死，看门狗才能可靠判定；
+- 触发器 = 登录时 + **每 1 分钟重复触发**（10 年有效期）；实例仍活着时被 `MultipleInstances=IgnoreNew` 跳过，进程死亡后由下一次触发拉起（恢复 ≤60 秒）；
+- `ExecutionTimeLimit = 0`（不限时长，否则代理会被默认 3 天限制杀掉）；`StartWhenAvailable`（睡眠错过触发点，醒来补跑）；
+- 日志由 relay 自己写文件（计划任务抓不到 stdout）：`%LOCALAPPDATA%\codex-relay\logs\relay.log`，5MB 自动轮转为 `relay.log.1`；
+- **安装时自动迁移**：停止并卸载旧版任务（`codex-relay-<端点>` / `codex-relay-watch`）、清掉旧的多进程 relay，再注册并启动单进程。重复执行是幂等的。
 
 ## 4. SessionStart hook（可选兜底）
 
@@ -142,24 +142,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -V
 
 | 手段 | 用法 |
 |---|---|
-| 健康 + 计数 | `GET /healthz`：`requests` / `a_rewrites` / `b_injections` / `b_skipped` / `errors` / `client_aborts` / `completed_aborts` |
-| 逐请求日志 | 起代理时设 `CODEX_RELAY_LOG=1`，输出 `#序号 状态 耗时 A=改写数` 与命中行 |
+| 健康 + 计数 | `GET /healthz`：`requests` / `a_rewrites` / `b_injections` / `b_skipped` / `errors` / `client_aborts` / `completed_aborts` / `recovered_errors` / `pid` |
+| 逐请求日志 | 起代理时设 `CODEX_RELAY_LOG=1`（或看 `%LOCALAPPDATA%\codex-relay\logs\relay.log`），输出 `#序号 状态 耗时 A=改写数` 与命中行 |
 | 抓包 | 起代理时设 `CODEX_RELAY_CAPTURE=<目录>`，落 `req-*.json` / `res-*.sse`，`Authorization` 脱敏；含全量 prompt，用完即删 |
 
 **计数含义**（`errors` 之外的计数都表示正常行为，不作为故障判据）：
 
-- `requests`：**只统计数据面**（`/healthz` 探活与监督脚本的探测不计入），等于"实际打给端点的模型请求数"；
+- `requests`：**只统计数据面**（`/healthz` 探活与脚本的探测不计入），等于"实际打给端点的模型请求数"；
 - `client_aborts`：Codex 收齐/主动取消后断开连接；
 - `completed_aborts`：已收到 `response.completed` 后厂商关闭连接（Kimi 实测如此，属正常）；
+- `recovered_errors`：被崩溃容忍处理器吞掉的未捕获异常数——非零说明进程发生过异常但仍在服务，应查日志定位；
 - `errors`：客户端仍在等而上游失败——**只有这个需要排查**。
 
 一次连接的中断只记一次：客户端断开与随之而来的上游断开是因果关系，代理内部归口到单一计数点（`abortCounted`），不会重复计数。
 
-日志位置：`%LOCALAPPDATA%\codex-relay\logs\`
-（`<端点>-supervisor.log` 监督记录、`<端点>-<时间戳>.out.log` 代理输出、`<端点>-ensure.*.log` ensure 输出）。
-每个端点的 `<时间戳>.out/.err.log` 只保留最近 20 对（崩溃循环时自动清理最旧的）；`-supervisor.log` 持续追加、不轮转。
+日志：`%LOCALAPPDATA%\codex-relay\logs\relay.log`（追加写，5MB 自动轮转为 `relay.log.1`），由 relay 自写——计划任务抓不到 stdout。旧的多进程日志（`<端点>-supervisor.log` 等）在迁移后不再产生，历史文件可留可删。
 
-**重载代理（改完代码/想重启进程）** 用 `ensure-proxy.ps1 -Restart`：它停掉监听进程，由现任监督进程拉起新进程（等待窗口覆盖一个退避周期）。**不要**手工去 kill 监督进程，也不要另起一个监督进程——同一端点同时只应有一个监督进程，重复拉起会被锁挡住并在日志里留下记录。
+**重载代理（改完代码/想重启进程）** 用 `ensure-proxy.ps1 -Restart`：结束当前 node 进程并立即重启任务（无任务时直接重新拉起），通常 1–3 秒完成。**不要**手工 kill 后不管——虽然有看门狗兜底（≤1 分钟），但显式重启更快。
 
 **升级 Codex 后必做**：跑一次 `probe-subagent.ps1`，确认 `A` 与 `B` 计数仍 > 0。DS / GLM 端点的形态失配是静默的——退回原始 bug，不会有任何报错。
 
@@ -170,34 +169,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File deploy\probe-subagent.ps1 -V
 **定位过程**（这套顺序在下次出问题时照抄即可）：
 
 ```powershell
-# 1) 端口是否在听、relay 进程还在不在、监督进程还有没有
+# 1) 端口是否在听、relay 进程还在不在、任务是否在运行
 Get-NetTCPConnection -LocalPort 18781,18782,18783 -State Listen | Select LocalPort, OwningProcess
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" | ? { $_.CommandLine -match 'relay\.js' }
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | ? { $_.CommandLine -match 'supervise-endpoint' -and $_.Cmdline -match '-Name \w' }
-
-# 2) 日志目录里最新的文件时间 → 判断"最后一次重启尝试"发生在什么时候
-Get-ChildItem $env:LOCALAPPDATA\codex-relay\logs | Sort LastWriteTime -Desc | Select -First 5
-
-# 3) 任务状态：LastTaskResult 0xC000013A = 进程被"控制台关闭/Ctrl+C"式终止
+Get-ScheduledTask -TaskName 'codex-relay' | Select State
 Get-ScheduledTask -TaskName 'codex-relay-*' | Get-ScheduledTaskInfo | Select TaskName, LastRunTime, LastTaskResult
+
+# 2) relay 日志最新内容 → 最后一次活动发生在什么时候
+Get-Content $env:LOCALAPPDATA\codex-relay\logs\relay.log -Tail 20
+
+# 3) LastTaskResult 0xC000013A = 进程被"控制台关闭/Ctrl+C"式终止
 ```
 
 **根因**：**监督进程在 09-11 03:34 就被外部终止了**（三个任务的 `LastTaskResult` 全是 `0xC000013A`，即控制台关闭/Ctrl+C 类终止；日志里此后没有任何记录）。三个 relay 作为独立进程活了下来，成了无人接管的"孤儿"，继续正常服务了两天。09-13 02:22 DeepSeek 的孤儿 relay 自己死掉（out/err 日志里没有崩溃痕迹，属外部终止），而没有任何机制去拉起它——端点任务只在登录时触发，任务级"失败重启"对这种进程退出并未生效。GLM / Kimi 的孤儿 relay 恰好还活着，所以只有 18781 挂了。
 
-**修复**（两层，均已落地）：
+**修复**（当日的两层修复，已被架构收敛取代）：
 
-1. `supervise-endpoint.ps1` 新增**守望模式**：监督进程拿到锁后发现端口已被服务（孤儿 relay），不再直接退出，而是每 30 秒探测、一旦不可用立刻接管。注意它**不会**重启健康中的 relay（实测接管前后 pid 不变），只接管后续故障；
-2. `ensure-proxy.ps1` 新增"端点在服务但没有监督进程"分支：打一个监督进程上去（进入守望模式）；`-Status` 也如实报告该状态：
-   `deepseek  :18781 up（但无监督进程）`；
-3. `install-tasks.ps1` 新增**看护任务** `codex-relay-watch`（登录时 + 每 5 分钟跑一次 `ensure-proxy.ps1`）——这才是"监督进程被杀"能自愈的机制。
+1. `supervise-endpoint.ps1` 新增**守望模式**：监督进程拿到锁后发现端口已被服务（孤儿 relay），不再直接退出，而是每 30 秒探测、一旦不可用立刻接管；
+2. `ensure-proxy.ps1` 新增"端点在服务但没有监督进程"分支；`-Status` 如实报告该状态；
+3. `install-tasks.ps1` 新增看护任务 `codex-relay-watch`（每 5 分钟 ensure）。
 
-**待执行（需要管理员）**：
+**后续（同日）——结构性收敛，监督层整体移除**：事故暴露的真正问题是"守护进程本身也会死"。与其继续加守护层，把架构收敛为：**单进程 relay（全部端点）+ 计划任务每 1 分钟看门狗触发**——看门狗就是任务计划程序本身（OS 组件，不需要守护），恢复 ≤60 秒，常驻进程从 6 个减到 1 个。旧的任务名与 `supervise-endpoint.ps1` 已在迁移中移除，`install-tasks.ps1` 会自动完成迁移。当时待执行的 `-WatchOnly` 步骤随之作废。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File deploy\install-tasks.ps1 -WatchOnly
-```
-
-**遗留判断**：`0xC000013A` 说明监督进程是被"控制台被关闭"这类事件带走的，具体触发者（某次会话/工具清理/杀软）无法从现有日志确定。守望模式 + 看护任务的设计不依赖找到它：无论何种原因被杀，最多 5 分钟自愈。
+**遗留判断**：`0xC000013A` 说明进程是被"控制台被关闭"这类事件带走的，具体触发者（某次会话/工具清理/杀软）无法从现有日志确定。看门狗设计不依赖找到它：无论何种原因死亡，最多 1 分钟自愈。
 
 ## 7. 回退与卸载
 
